@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
+import torchvision
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
 
 from config import params
-
 class AFQS(nn.Module):
     def __init__(self, threshold=params["AFQS_threshold"], max_pool_size=params["AFQS_max_pool_size"], num_classes=80, feature_dim=256):
         super().__init__()
@@ -66,3 +68,22 @@ class AFQS(nn.Module):
         
         return SADQ, selection_mask
     
+class ResNet50Backbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        resnet = torchvision.models.resnet50(weights="DEFAULT")  # Poids ImageNet
+        
+        # Extraction des couches (sans avgpool/fc)
+        self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
+        self.layer1 = resnet.layer1  # 256 canaux
+        self.layer2 = resnet.layer2  # 512 canaux
+        self.layer3 = resnet.layer3  # 1024 canaux
+        self.layer4 = resnet.layer4  # 2048 canaux
+
+    def forward(self, x):
+        x = self.stem(x)
+        c2 = self.layer1(x)  # Résolution 1/4
+        c3 = self.layer2(c2) # Résolution 1/8
+        c4 = self.layer3(c3) # Résolution 1/16
+        c5 = self.layer4(c4) # Résolution 1/32
+        return [c2, c3, c4, c5]  # Features multi-échelles

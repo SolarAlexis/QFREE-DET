@@ -6,7 +6,6 @@ import matplotlib.patches as patches
 from PIL import Image
 import numpy as np
 import json
-import torch
 
 # Chemins vers les données COCO
 data_dir = "D:\\COCO2017"
@@ -49,7 +48,7 @@ class ResizeWithAnnotations:
 class CustomCocoDetection(CocoDetection):
     def __init__(self, root, annFile, transform=None):
         super().__init__(root, annFile, transform=None)
-        self.resize_transform = ResizeWithAnnotations((224, 224))
+        self.resize_transform = ResizeWithAnnotations((640, 640))
         self.user_transform = transform
 
     def __getitem__(self, index):
@@ -67,7 +66,11 @@ class CustomCocoDetection(CocoDetection):
 
 # Transformation finale (conversion en Tensor)
 transform = torchvision.transforms.Compose([
-    torchvision.transforms.ToTensor()
+    torchvision.transforms.ToTensor(),  # Convertit en Tensor [0, 1]
+    # torchvision.transforms.Normalize(   # Normalisation ImageNet
+    #     mean=[0.485, 0.456, 0.406],    # Moyenne ImageNet
+    #     std=[0.229, 0.224, 0.225]      # Écart-type ImageNet
+    # )
 ])
 
 # Chargement des datasets
@@ -115,7 +118,7 @@ if __name__ == "__main__":
     
     for i, ax in enumerate(axs.flat):
         # Chargement d'un exemple
-        image_tensor, targets = train_dataset[i+4]  # Changer l'indice pour d'autres exemples
+        image_tensor, targets = train_dataset[i+8]  # Changer l'indice pour d'autres exemples
         
         # Affichage
         show_image_with_boxes(ax, image_tensor, targets)
