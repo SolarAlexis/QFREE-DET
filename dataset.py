@@ -67,10 +67,10 @@ class CustomCocoDetection(CocoDetection):
 # Transformation finale (conversion en Tensor)
 transform = torchvision.transforms.Compose([
     torchvision.transforms.ToTensor(),  # Convertit en Tensor [0, 1]
-    # torchvision.transforms.Normalize(   # Normalisation ImageNet
-    #     mean=[0.485, 0.456, 0.406],    # Moyenne ImageNet
-    #     std=[0.229, 0.224, 0.225]      # Écart-type ImageNet
-    # )
+    torchvision.transforms.Normalize(   # Normalisation ImageNet
+        mean=[0.485, 0.456, 0.406],    # Moyenne ImageNet
+        std=[0.229, 0.224, 0.225]      # Écart-type ImageNet
+    )
 ])
 
 # Chargement des datasets
@@ -114,29 +114,59 @@ def show_image_with_boxes(ax, image_tensor, targets):
 
 # Visualisation des résultats
 if __name__ == "__main__":
-    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
     
-    for i, ax in enumerate(axs.flat):
-        # Chargement d'un exemple
-        image_tensor, targets = train_dataset[i+8]  # Changer l'indice pour d'autres exemples
+    # ----------------------------------------------------------------------
+    # Test affichage du dataset avec les bounding box associées
+    # ----------------------------------------------------------------------
+    
+    # fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+    
+    # for i, ax in enumerate(axs.flat):
+    #     # Chargement d'un exemple
+    #     image_tensor, targets = train_dataset[i+8]  # Changer l'indice pour d'autres exemples
         
-        # Affichage
-        show_image_with_boxes(ax, image_tensor, targets)
-        ax.axis('off')
+    #     # Affichage
+    #     show_image_with_boxes(ax, image_tensor, targets)
+    #     ax.axis('off')
 
-    plt.tight_layout()
-    plt.show()
+    # plt.tight_layout()
+    # plt.show()
 
-    # # Charger ResNet-50
-    # resnet50 = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)  # Utiliser les poids par défaut
-    # resnet50.eval()  # Passer en mode évaluation
+    # ----------------------------------------------------------------------
+    # Test de passer les données dans le backbone
+    # ----------------------------------------------------------------------
+    
+    import torch
+    from model import ResNet50Backbone
+    
+    # Vérifier si CUDA est disponible
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
-    # # Préparer l'image pour ResNet-50
-    # image_tensor = transform(image_pil)  # Appliquer la transformation
-    # image_tensor = image_tensor.unsqueeze(0)  # Ajouter une dimension de batch
+    # Instancier le backbone
+    backbone = ResNet50Backbone().to(device)
 
-    # # Passer l'image à ResNet-50
-    # with torch.no_grad():
-    #     features = resnet50(image_tensor)
+    # Récupérer un batch de données
+    batch = next(iter(train_loader))
+    images, targets = batch
+    images = images.to(device)
 
-    # print("Features shape:", features.shape)  # Afficher la forme des caractéristiques extraites
+    # Afficher les dimensions d'entrée
+    print("\nDimensions d'entrée:")
+    print(f"Batch shape: {images.shape}")  # Devrait être [8, 3, 640, 640]
+
+    # Forward pass
+    with torch.no_grad():
+        features = backbone(images)
+
+    # Afficher les dimensions de sortie
+    print("\nDimensions des features maps en sortie:")
+    print("C2 (layer1):", features[0].shape)  # [N, 256, 160, 160]
+    print("C3 (layer2):", features[1].shape)  # [N, 512, 80, 80]
+    print("C4 (layer3):", features[2].shape)  # [N, 1024, 40, 40]
+    print("C5 (layer4):", features[3].shape)  # [N, 2048, 20, 20]
+
+    # Vérification mémoire CUDA
+    if device.type == 'cuda':
+        print("\nUtilisation mémoire CUDA:")
+        print(torch.cuda.memory_allocated(device=device) / 1024**3, "GB")
