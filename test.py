@@ -1,11 +1,18 @@
-import torch
+import os
+from PIL import Image
+import copy
 
-from model import AFQS
+import torch
+import matplotlib.pyplot as plt
+
+from model import AFQS, ResNet50Backbone
+from dataset import train_dataset, train_loader, train_ann_data, transform, train_dir, show_image_with_boxes
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def test_afqs():
     # Paramètres communs
     feature_dim = 256
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ----------------------------------------------------------------------
     # Cas 1: Entraînement - Max des requêtes valides (50) < max_pool_size (100)
@@ -192,6 +199,168 @@ def test_afqs():
     assert model.class_head.bias.grad is not None, "Gradient manquant pour class_head.bias"
 
     print("Cas 7 (Flux de gradient complet) réussi ✅")
+
+def test_dataset_and_backbone():
+    # ----------------------------------------------------------------------
+    # Test 1: Vérification du chargement des données et des transformations
+    # ----------------------------------------------------------------------
+    # Récupérer un échantillon du dataset
+    image_tensor, targets = train_dataset[0]
     
+    # Vérifier les dimensions de l'image
+    assert image_tensor.shape == (3, 640, 640), f"Shape incorrect: {image_tensor.shape}"
+    
+    # Vérifier la présence d'annotations
+    assert len(targets) > 0, "Aucune annotation trouvée"
+    
+    # Vérifier le format des annotations
+    for ann in targets:
+        assert 'bbox' in ann, "Clé 'bbox' manquante"
+        assert 'category_id' in ann, "Clé 'category_id' manquante"
+        
+    print("Test 1 (Chargement données) réussi ✅")
+
+    # ----------------------------------------------------------------------
+    # Test 2: Vérification du DataLoader et collate_fn
+    # ----------------------------------------------------------------------
+    batch = next(iter(train_loader))
+    images, targets = batch
+    
+    # Vérifier le format du batch
+    assert images.shape == (8, 3, 640, 640), f"Shape batch incorrect: {images.shape}"
+    assert len(targets) == 8, f"Nombre d'annotations incorrect: {len(targets)}"
+    
+    # Vérifier le type des annotations
+    assert isinstance(targets, list), "Les annotations doivent être une liste"
+    assert all(isinstance(t, list) for t in targets), "Chaque élément doit être une liste d'annotations"
+    
+    print("Test 2 (DataLoader) réussi ✅")
+
+    # ----------------------------------------------------------------------
+    # Test 3: Vérification des sorties du backbone
+    # ----------------------------------------------------------------------
+    backbone = ResNet50Backbone().to(device)
+    images = images.to(device)
+    
+    with torch.no_grad():
+        features = backbone(images)
+    
+    # Vérifier les dimensions des features maps
+    assert features[0].shape == (8, 256, 160, 160), f"C2 shape incorrect: {features[0].shape}"
+    assert features[1].shape == (8, 512, 80, 80), f"C3 shape incorrect: {features[1].shape}"
+    assert features[2].shape == (8, 1024, 40, 40), f"C4 shape incorrect: {features[2].shape}"
+    assert features[3].shape == (8, 2048, 20, 20), f"C5 shape incorrect: {features[3].shape}"
+    
+    print("Test 3 (Backbone outputs) réussi ✅")
+
+    # ----------------------------------------------------------------------
+    # Test 4: Vérification du redimensionnement des bounding boxes (CORRIGÉ)
+    # ----------------------------------------------------------------------
+    # Trouver une image avec annotations
+    sample_idx = next((i for i, (_, t) in enumerate(train_dataset) if len(t) > 0), None)
+    assert sample_idx is not None, "Aucune image annotée trouvée"
+    
+    # Récupérer les données originales
+    image_id = train_dataset.image_ids[sample_idx]
+    image_info = next(img for img in train_ann_data['images'] if img['id'] == image_id)
+    original_anns = [copy.deepcopy(ann) for ann in train_ann_data['annotations'] if ann['image_id'] == image_id]
+    
+    # Charger l'image originale
+    original_image = Image.open(os.path.join(train_dir, image_info['file_name'])).convert('RGB')
+    
+    # Appliquer la transformation avec copie
+    transformed_image, transformed_anns = transform(copy.deepcopy(original_image), copy.deepcopy(original_anns))
+    
+    # Vérifier une annotation
+    original_bbox = original_anns[0]['bbox']
+    transformed_bbox = transformed_anns[0]['bbox']
+    
+    # Calcul des ratios théoriques
+    x_scale = 640 / original_image.width
+    y_scale = 640 / original_image.height
+    
+    # Vérification avec marge d'erreur
+    assert abs(transformed_bbox[1] - original_bbox[1] * y_scale) < 1e-4, (
+        f"Erreur Y: {transformed_bbox[1]} vs {original_bbox[1] * y_scale} "
+        f"(Original H: {original_image.height}px)"
+    )
+    
+    print("Test 4 (BBox scaling) réussi ✅")
+
+    # ----------------------------------------------------------------------
+    # Test 5: Vérification de la normalisation des images
+    # ----------------------------------------------------------------------
+    # 1. Créer une image artificielle rouge uni
+    fake_image = Image.new('RGB', (640, 640), color=(255, 0, 0))
+    
+    # 2. Appliquer la transformation complète
+    tensor_img, _ = transform(fake_image, [])
+    
+    # 3. Calculer les canaux normalisés
+    red_channel = tensor_img[0].mean().item()
+    green_channel = tensor_img[1].mean().item()
+    blue_channel = tensor_img[2].mean().item()
+    
+    # 4. Valeurs théoriques attendues pour du rouge pur
+    expected_red = (255/255 - 0.485)/0.229    # ≈ (1.0 - 0.485)/0.229 ≈ 2.2489
+    expected_green = (0/255 - 0.456)/0.224    # ≈ (-0.456)/0.224 ≈ -2.0357
+    expected_blue = (0/255 - 0.406)/0.225     # ≈ (-0.406)/0.225 ≈ -1.8044
+
+    # 5. Vérification avec tolérance
+    assert abs(red_channel - expected_red) < 0.01, f"R: {red_channel:.4f} vs {expected_red:.4f}"
+    assert abs(green_channel - expected_green) < 0.01, f"G: {green_channel:.4f} vs {expected_green:.4f}"
+    assert abs(blue_channel - expected_blue) < 0.01, f"B: {blue_channel:.4f} vs {expected_blue:.4f}"
+    
+    print("Test 5 (Normalisation) réussi ✅")
+
+def test_visualization():
+    # ----------------------------------------------------------------------
+    # Test 6: Vérification de la visualisation des images et des bounding boxes
+    # ----------------------------------------------------------------------
+    # Trouver 8 images avec des annotations
+    sample_indices = []
+    for i in range(1, len(train_dataset)):
+        _, targets = train_dataset[i]
+        if len(targets) > 0:
+            sample_indices.append(i)
+            if len(sample_indices) == 8:
+                break
+    assert len(sample_indices) == 8, "Pas assez d'images avec annotations trouvées"
+    
+    # Créer une figure pour l'affichage (2 lignes, 4 colonnes)
+    fig, axs = plt.subplots(2, 4, figsize=(14, 7))  # Taille ajustée pour 8 images
+    
+    # Afficher chaque image avec ses bounding boxes
+    for i, ax in enumerate(axs.flat):
+        # Charger l'image et ses annotations
+        image_tensor, targets = train_dataset[sample_indices[i]]
+        
+        # Vérifier les dimensions de l'image
+        assert image_tensor.shape == (3, 640, 640), f"Shape incorrect: {image_tensor.shape}"
+        
+        # Vérifier la présence d'annotations
+        assert len(targets) > 0, "Aucune annotation trouvée pour cette image"
+        
+        # Afficher l'image avec les bounding boxes
+        show_image_with_boxes(ax, image_tensor, targets, normalized=True)
+        ax.axis('off')
+        
+        # Vérifier que l'image est correctement dénormalisée
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        denormalized_image = image_tensor * std + mean
+        
+        # Vérifier que les valeurs sont dans [0, 1] après dénormalisation
+        assert torch.all(denormalized_image >= 0).item(), "Erreur de dénormalisation : valeurs négatives"
+        assert torch.all(denormalized_image <= 1).item(), "Erreur de dénormalisation : valeurs > 1"
+    
+    # Afficher la figure
+    plt.tight_layout()
+    plt.show()
+    
+    print("Test 6 (Visualisation) réussi ✅")
+
 if __name__ == "__main__":
     test_afqs()
+    test_dataset_and_backbone()
+    test_visualization()

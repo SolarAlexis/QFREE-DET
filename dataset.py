@@ -1,11 +1,14 @@
 import torchvision
-from torchvision.datasets import CocoDetection
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from PIL import Image
 import numpy as np
 import json
+import os
+import torch
+
 
 # Chemins vers les données COCO
 data_dir = "D:\\COCO2017"
@@ -16,70 +19,132 @@ val_ann_file = f"{data_dir}/annotations/instances_val2017.json"
 
 # Transformation pour redimensionner l'image et ajuster les annotations
 class ResizeWithAnnotations:
-    def __init__(self, size):
+    def __init__(self, size, apply_normalization=True):
         self.size = size
+        self.apply_normalization = apply_normalization 
+        self.to_tensor = torchvision.transforms.ToTensor()
+        
+        # Initialiser la normalisation seulement si nécessaire
+        if self.apply_normalization:
+            self.normalize = torchvision.transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )
+        else:
+            self.normalize = None
 
     def __call__(self, image, target):
-        # Vérification du type d'image
-        if not isinstance(image, Image.Image):
-            raise TypeError(f"Expected PIL.Image, got {type(image)}")
-
+        # Créer une copie profonde des annotations
+        processed_target = []
         original_width, original_height = image.size
-        # Redimensionnement de l'image
-        image = torchvision.transforms.functional.resize(image, self.size)
         new_width, new_height = self.size
-
-        # Ajustement des annotations
+        
         for t in target:
-            bbox = t['bbox']
-            # Calcul des ratios de redimensionnement
+            # Copier le dictionnaire d'annotation
+            new_t = t.copy()
+            bbox = new_t['bbox'].copy()
+            
+            # Calcul des ratios
             x_scale = new_width / original_width
             y_scale = new_height / original_height
             
-            # Mise à jour des coordonnées de la boîte
+            # Mise à l'échelle
             bbox[0] *= x_scale
             bbox[1] *= y_scale
             bbox[2] *= x_scale
             bbox[3] *= y_scale
+            
+            new_t['bbox'] = bbox
+            processed_target.append(new_t)
 
-        return image, target
+        # Redimensionnement de l'image
+        image = torchvision.transforms.functional.resize(image, self.size)
+        image = self.to_tensor(image)
+        
+        # Application conditionnelle de la normalisation
+        if self.apply_normalization:
+            image = self.normalize(image)
+        
+        return image, processed_target
 
 # Dataset personnalisé avec gestion intégrée du redimensionnement
-class CustomCocoDetection(CocoDetection):
-    def __init__(self, root, annFile, transform=None):
-        super().__init__(root, annFile, transform=None)
-        self.resize_transform = ResizeWithAnnotations((640, 640))
-        self.user_transform = transform
+class FastCocoDataset(torch.utils.data.Dataset):
+    def __init__(self, img_dir, ann_data, transform=None):
+        self.img_dir = img_dir
+        self.ann_data = ann_data
+        self.transform = transform
+        
+        # Créer un index image_id -> annotations
+        self.img_ann_map = {}
+        for ann in ann_data['annotations']:
+            self.img_ann_map.setdefault(ann['image_id'], []).append(ann)
+        
+        self.image_ids = list(sorted(self.img_ann_map.keys()))
+    
+    def __len__(self):
+        return len(self.image_ids)
+    
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        img_info = next((img for img in self.ann_data['images'] if img['id'] == image_id), None)
+        
+        # Charger l'image
+        img_path = os.path.join(self.img_dir, img_info['file_name'])
+        image = Image.open(img_path).convert('RGB')
+        
+        # Récupérer les annotations
+        anns = self.img_ann_map.get(image_id, [])
+        
+        # Appliquer les transformations SI ELLES EXISTENT
+        if self.transform:
+            image, anns = self.transform(image, anns)
+        else:
+            # Conversion de base si aucune transformation
+            image = torchvision.transforms.functional.to_tensor(image)
+        
+        return image, anns
+    
+def custom_collate_fn(batch):
+    """
+    Gère les annotations de taille variable en les retournant sous forme de liste
+    """
+    # Séparer les images et les annotations
+    images = []
+    targets = []
+    
+    for img, tgt in batch:
+        images.append(img)
+        targets.append(tgt)
+    
+    # Empiler les images (elles ont toutes la même taille grâce au redimensionnement)
+    images = default_collate(images)
+    
+    return images, targets  # Les annotations restent une liste de dictionnaires
 
-    def __getitem__(self, index):
-        # Récupération de l'image originale (PIL) et des annotations
-        image, target = super().__getitem__(index)
-        
-        # Application du redimensionnement et ajustement des annotations
-        image, target = self.resize_transform(image, target)
-        
-        # Conversion en Tensor si spécifié
-        if self.user_transform:
-            image = self.user_transform(image)
-            
-        return image, target
 
 # Transformation finale (conversion en Tensor)
-transform = torchvision.transforms.Compose([
-    torchvision.transforms.ToTensor(),  # Convertit en Tensor [0, 1]
-    torchvision.transforms.Normalize(   # Normalisation ImageNet
-        mean=[0.485, 0.456, 0.406],    # Moyenne ImageNet
-        std=[0.229, 0.224, 0.225]      # Écart-type ImageNet
-    )
-])
+transform = ResizeWithAnnotations((640, 640))
+
+def load_coco_annotations(ann_file):
+    from pycocotools.coco import COCO
+    coco = COCO(ann_file)
+    return {
+        "images": coco.dataset['images'],
+        "annotations": coco.dataset['annotations'],
+        "categories": coco.dataset['categories']
+    }
+
+# Charger les annotations une seule fois
+train_ann_data = load_coco_annotations(train_ann_file)
+val_ann_data = load_coco_annotations(val_ann_file)
 
 # Chargement des datasets
-train_dataset = CustomCocoDetection(train_dir, train_ann_file, transform=transform)
-val_dataset = CustomCocoDetection(val_dir, val_ann_file, transform=transform)
+train_dataset = FastCocoDataset(train_dir, train_ann_data, transform=transform)
+val_dataset = FastCocoDataset(val_dir, val_ann_data, transform=transform)
 
 # Création des DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=4)
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
+val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=0, collate_fn=custom_collate_fn)
 
 # Chargement des catégories pour l'affichage
 with open(train_ann_file, 'r') as f:
@@ -88,9 +153,19 @@ categories = coco_data['categories']
 category_id_to_name = {category['id']: category['name'] for category in categories}
 
 # Fonction d'affichage avec les nouvelles coordonnées
-def show_image_with_boxes(ax, image_tensor, targets):
+def show_image_with_boxes(ax, image_tensor, targets, normalized=True):
+    
+    # Dénormalisation si nécessaire
+    if normalized:
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        image = image_tensor * std + mean  # Dénormalisation
+    else:
+        image = image_tensor
+    
     # Conversion du tensor en image PIL
-    image = image_tensor.permute(1, 2, 0).numpy()
+    image = image.permute(1, 2, 0).numpy()  # Utiliser la variable `image` dénormalisée
+    image = np.clip(image, 0, 1)  # S'assurer que les valeurs sont dans [0, 1]
     image = (image * 255).astype(np.uint8)
     ax.imshow(image)
 
@@ -111,62 +186,3 @@ def show_image_with_boxes(ax, image_tensor, targets):
         )
         ax.add_patch(rect)
         ax.text(bbox[0], bbox[1], class_name, color='white', backgroundcolor='red', fontsize=8)
-
-# Visualisation des résultats
-if __name__ == "__main__":
-    
-    # ----------------------------------------------------------------------
-    # Test affichage du dataset avec les bounding box associées
-    # ----------------------------------------------------------------------
-    
-    # fig, axs = plt.subplots(2, 2, figsize=(10, 10))
-    
-    # for i, ax in enumerate(axs.flat):
-    #     # Chargement d'un exemple
-    #     image_tensor, targets = train_dataset[i+8]  # Changer l'indice pour d'autres exemples
-        
-    #     # Affichage
-    #     show_image_with_boxes(ax, image_tensor, targets)
-    #     ax.axis('off')
-
-    # plt.tight_layout()
-    # plt.show()
-
-    # ----------------------------------------------------------------------
-    # Test de passer les données dans le backbone
-    # ----------------------------------------------------------------------
-    
-    import torch
-    from model import ResNet50Backbone
-    
-    # Vérifier si CUDA est disponible
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    # Instancier le backbone
-    backbone = ResNet50Backbone().to(device)
-
-    # Récupérer un batch de données
-    batch = next(iter(train_loader))
-    images, targets = batch
-    images = images.to(device)
-
-    # Afficher les dimensions d'entrée
-    print("\nDimensions d'entrée:")
-    print(f"Batch shape: {images.shape}")  # Devrait être [8, 3, 640, 640]
-
-    # Forward pass
-    with torch.no_grad():
-        features = backbone(images)
-
-    # Afficher les dimensions de sortie
-    print("\nDimensions des features maps en sortie:")
-    print("C2 (layer1):", features[0].shape)  # [N, 256, 160, 160]
-    print("C3 (layer2):", features[1].shape)  # [N, 512, 80, 80]
-    print("C4 (layer3):", features[2].shape)  # [N, 1024, 40, 40]
-    print("C5 (layer4):", features[3].shape)  # [N, 2048, 20, 20]
-
-    # Vérification mémoire CUDA
-    if device.type == 'cuda':
-        print("\nUtilisation mémoire CUDA:")
-        print(torch.cuda.memory_allocated(device=device) / 1024**3, "GB")
