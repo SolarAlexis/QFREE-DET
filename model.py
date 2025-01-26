@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torchvision
-import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+import torch.nn.functional as F
+import math
 
 from config import params
 class AFQS(nn.Module):
@@ -87,3 +87,193 @@ class ResNet50Backbone(nn.Module):
         c4 = self.layer3(c3) # Résolution 1/16
         c5 = self.layer4(c4) # Résolution 1/32
         return [c2, c3, c4, c5]  # Features multi-échelles
+
+
+class PositionalEncoding2D(nn.Module):
+    """Encodage positionnel 2D corrigé pour 640x640"""
+    def __init__(self, d_model):
+        super().__init__()
+        if d_model % 4 != 0:
+            raise ValueError("d_model doit être divisible par 4")
+        
+        self.d_model = d_model
+        self.dim = d_model // 4  # 64 pour d_model=256
+
+    def forward(self, B, H, W, device):
+        pe = torch.zeros(B, H, W, self.d_model, device=device)
+        
+        # Calcul des termes de fréquence
+        div_term = torch.exp(
+            torch.arange(0, self.dim, 1, device=device).float() *
+            (-math.log(10000.0) / self.dim)
+        )
+        
+        # Encodage hauteur -----------------------------------------------------
+        y_pos = torch.arange(H, device=device).float().view(-1, 1, 1)  # [H, 1, 1]
+        y_sin = torch.sin(y_pos * div_term)  # [H, 1, dim]
+        y_cos = torch.cos(y_pos * div_term)  # [H, 1, dim]
+        y_enc = torch.cat([y_sin, y_cos], dim=-1)  # [H, 1, 2*dim]
+        pe[..., :self.d_model//2] = y_enc.expand(-1, W, -1).unsqueeze(0)  # [B, H, W, d_model//2]
+
+        # Encodage largeur -----------------------------------------------------
+        x_pos = torch.arange(W, device=device).float().view(1, -1, 1)  # [1, W, 1]
+        x_sin = torch.sin(x_pos * div_term)  # [1, W, dim]
+        x_cos = torch.cos(x_pos * div_term)  # [1, W, dim]
+        x_enc = torch.cat([x_sin, x_cos], dim=-1)  # [1, W, 2*dim]
+        pe[..., self.d_model//2:] = x_enc.expand(H, -1, -1).unsqueeze(0)  # [B, H, W, d_model//2]
+
+        return pe
+
+class DeformableAttention(nn.Module):
+    def __init__(self, d_model=256, nhead=8, num_points=4):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_points = num_points
+        
+        self.offset_pred = nn.Conv2d(d_model, nhead * num_points * 2, kernel_size=3, padding=1)
+        self.attn_pred = nn.Conv2d(d_model, nhead * num_points, kernel_size=3, padding=1)
+        self.output_proj = nn.Linear(d_model, d_model)
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.constant_(self.offset_pred.weight, 0)
+        nn.init.constant_(self.offset_pred.bias, 0)
+        nn.init.xavier_uniform_(self.attn_pred.weight)
+        nn.init.constant_(self.attn_pred.bias, 0)
+
+    def forward(self, x, H, W):
+        B, N, D = x.shape
+        x_spatial = x.view(B, H, W, D).permute(0, 3, 1, 2)  # [B, D, H, W]
+        
+        # 1. Prédiction des paramètres
+        offsets = self.offset_pred(x_spatial).view(B, self.nhead, self.num_points, 2, H, W)
+        attn = F.softmax(self.attn_pred(x_spatial).view(B, self.nhead, self.num_points, H, W), dim=2)
+        
+        # 2. Calcul des positions
+        ref_y, ref_x = torch.meshgrid(
+            torch.linspace(0.0, 1.0, H, device=x.device),
+            torch.linspace(0.0, 1.0, W, device=x.device),
+            indexing='ij'
+        )
+        ref = torch.stack((ref_x, ref_y), 0)  # [2, H, W]
+        ref = ref.unsqueeze(0).unsqueeze(2).unsqueeze(3)  # [1, 2, 1, 1, H, W]
+        pos = ref.expand(B, 2, self.nhead, self.num_points, H, W) + offsets.permute(0, 3, 1, 2, 4, 5) * 0.1
+        pos = pos.permute(0, 2, 3, 5, 4, 1).reshape(B*self.nhead*self.num_points, H, W, 2)
+        
+        # 3. Échantillonnage et agrégation
+        sampled = F.grid_sample(
+            x_spatial.repeat_interleave(self.nhead*self.num_points, 0),
+            pos,
+            align_corners=False
+        ).view(B, self.nhead, self.num_points, D, H, W)
+        
+        # 4. Combinaison finale corrigée
+        out = (sampled * attn.unsqueeze(3)).sum(2)  # [B, nhead, D, H, W]
+        out = out.permute(0, 2, 3, 4, 1).reshape(B, D, H*W, self.nhead)  # Nouveau reshape
+        out = out.mean(dim=-1).permute(0, 2, 1)  # Fusion des têtes
+        
+        return self.output_proj(out)
+
+class TransformerEncoderLayer(nn.Module):
+    """Couche encodeur avec gestion dynamique du type d'attention"""
+    def __init__(self, d_model=256, nhead=8, dim_feedforward=1024, 
+                 dropout=0.1, attention_type='deformable', num_points=4):
+        super().__init__()
+        self.attention_type = attention_type
+        
+        if attention_type == 'deformable':
+            self.self_attn = DeformableAttention(d_model, nhead, num_points)
+        else:
+            self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = F.relu
+
+    def forward(self, src, H=None, W=None):
+        # Attention
+        if self.attention_type == 'deformable':
+            src2 = self.self_attn(src, H, W)
+        else:
+            src2 = self.self_attn(src, src, src)[0]
+        
+        # Residual + Norm
+        src = src + self.dropout(src2)
+        src = self.norm1(src)
+        
+        # FFN
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout(src2)
+        src = self.norm2(src)
+        
+        return src
+
+class TransformerEncoder(nn.Module):
+    """Encodeur avec gestion précise des dimensions spatiales"""
+    def __init__(self, d_model=256, nhead=8, num_layers=6, 
+                 dim_feedforward=1024, dropout=0.1, 
+                 attention_type='deformable', num_points=4):
+        super().__init__()
+        
+        self.projection = nn.Conv2d(2048, d_model, 1)
+        self.pos_encoder = PositionalEncoding2D(d_model)
+        
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                attention_type=attention_type,
+                num_points=num_points
+            ) for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        # x: [B, 2048, 20, 20] (pour entrée 640x640)
+        x = self.projection(x)  # [B, 256, 20, 20]
+        B, D, H, W = x.shape
+        
+        # Encodage positionnel dynamique
+        pos = self.pos_encoder(B, H, W, x.device)  # [B, 20, 20, 256]
+        
+        # Fusion features + position
+        x = x.permute(0, 2, 3, 1)  # [B, 20, 20, 256]
+        x = x + pos
+        x = x.view(B, H*W, D)  # [B, 400, 256]
+
+        # Passage dans les couches
+        for layer in self.layers:
+            if layer.attention_type == 'deformable':
+                x = layer(x, H, W)
+            else:
+                x = layer(x)
+        
+        return x  # [B, 400, 256]
+
+class QFreeDet(nn.Module):
+    def __init__(self, backbone, afqs, encoder):
+        super().__init__()
+        self.backbone = backbone    # ResNet50Backbone
+        self.encoder = encoder      # Transformer Encoder
+        self.afqs = afqs            # AFQS module
+
+    def forward(self, x):
+        # 1. Extract multi-scale features
+        features = self.backbone(x)
+        
+        # 2. Use last feature map (c5) for encoding
+        c5 = features[-1]  # [B, 2048, H, W]
+        
+        # 3. Transform to encoder tokens
+        encoder_tokens = self.encoder(c5)  # [B, N, D]
+        
+        # 4. Query selection
+        SADQ, selection_mask = self.afqs(encoder_tokens)
+        
+        return SADQ, selection_mask

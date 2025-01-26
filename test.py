@@ -5,7 +5,7 @@ import copy
 import torch
 import matplotlib.pyplot as plt
 
-from model import AFQS, ResNet50Backbone
+from model import AFQS, ResNet50Backbone, PositionalEncoding2D, DeformableAttention, TransformerEncoder, QFreeDet
 from dataset import train_dataset, train_loader, train_ann_data, transform, train_dir, show_image_with_boxes
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -360,7 +360,80 @@ def test_visualization():
     
     print("Test 6 (Visualisation) réussi ✅")
 
+def test_positional_encoding():
+    """Teste l'encodage positionnel 2D"""
+    # 1. Initialisation
+    d_model = 256
+    pe = PositionalEncoding2D(d_model)
+    B, H, W = 2, 20, 20
+    
+    # 2. Exécution
+    encoding = pe(B, H, W, torch.device('cpu'))
+    
+    # 3. Vérifications
+    assert encoding.shape == (B, H, W, d_model), f"Mauvaise shape: {encoding.shape}"
+    assert not torch.allclose(encoding[0,0,0], encoding[0,1,0]), "Encodage vertical manquant"
+    assert not torch.allclose(encoding[0,0,0], encoding[0,0,1]), "Encodage horizontal manquant"
+    print("Test PositionalEncoding2D réussi ✅")
+
+def test_deformable_attention():
+    """Teste le module d'attention déformable avec dimensions corrigées"""
+    B, H, W, D = 2, 20, 20, 256
+    layer = DeformableAttention(D, nhead=8, num_points=4)
+    x = torch.randn(B, H*W, D)
+    
+    output = layer(x, H, W)
+    
+    assert output.shape == (B, H*W, D), f"Shape sortie: {output.shape}"
+    print("Test DeformableAttention réussi ✅")
+    
+def test_transformer_encoder():
+    """Teste l'encodeur Transformer complet"""
+    # 1. Configuration
+    encoder = TransformerEncoder(
+        d_model=256,
+        nhead=8,
+        num_layers=2,
+        attention_type='deformable',
+        num_points=4
+    )
+    
+    # 2. Données test (sortie backbone)
+    c5 = torch.randn(2, 2048, 20, 20)  # Shape typique pour entrée 640x640
+    
+    # 3. Forward pass
+    encoder_tokens = encoder(c5)
+    
+    # 4. Vérifications
+    assert encoder_tokens.shape == (2, 400, 256), f"Shape tokens incorrect: {encoder_tokens.shape}"
+    print("Test TransformerEncoder réussi ✅")
+
+def test_full_model():
+    """Test d'intégration complet"""
+    # 1. Initialisation avec max_pool_size=100
+    backbone = ResNet50Backbone()
+    encoder = TransformerEncoder()
+    afqs = AFQS(max_pool_size=100) 
+    model = QFreeDet(backbone, afqs, encoder)
+    
+    # 2. Données test
+    x = torch.randn(2, 3, 640, 640)
+    
+    # 3. Forward pass
+    sadq, mask = model(x)
+    
+    # 4. Vérifications
+    assert sadq.shape == (2, 100, 256), f"Shape SADQ incorrect: {sadq.shape}"
+    assert mask.shape == (2, 400), f"Shape mask incorrect: {mask.shape}"
+    print("Test intégration complet réussi ✅")
+
 if __name__ == "__main__":
-    test_afqs()
-    test_dataset_and_backbone()
-    test_visualization()
+    
+    test_positional_encoding()
+    test_deformable_attention()
+    test_transformer_encoder()
+    test_full_model()
+    
+    # test_afqs()
+    # test_dataset_and_backbone()
+    # test_visualization()
