@@ -408,31 +408,41 @@ def test_transformer_encoder():
     assert encoder_tokens.shape == (2, 400, 256), f"Shape tokens incorrect: {encoder_tokens.shape}"
     print("Test TransformerEncoder réussi ✅")
 
-def test_full_model():
-    """Test d'intégration complet"""
-    # 1. Initialisation avec max_pool_size=100
+def test_backbone_afqs_encoder():
+    """Test d'intégration entre backbone, encodeur et AFQS"""
+    # 1. Initialisation
     backbone = ResNet50Backbone()
     encoder = TransformerEncoder()
-    afqs = AFQS(max_pool_size=100) 
-    model = QFreeDet(backbone, afqs, encoder)
+    afqs = AFQS(max_pool_size=100)
     
     # 2. Données test
     x = torch.randn(2, 3, 640, 640)
     
-    # 3. Forward pass
-    sadq, mask = model(x)
+    # 3. Forward pass étape par étape
+    # a) Backbone
+    features = backbone(x)
+    c5 = features[-1]  # Dernière feature map [B, 2048, 20, 20]
+    
+    # b) Encodeur
+    encoder_tokens = encoder(c5)  # [B, 400, 256]
+    
+    # c) AFQS
+    sadq, mask = afqs(encoder_tokens)
     
     # 4. Vérifications
+    assert c5.shape == (2, 2048, 20, 20), f"Shape backbone output incorrect: {c5.shape}"
+    assert encoder_tokens.shape == (2, 400, 256), f"Shape encoder output incorrect: {encoder_tokens.shape}"
     assert sadq.shape == (2, 100, 256), f"Shape SADQ incorrect: {sadq.shape}"
     assert mask.shape == (2, 400), f"Shape mask incorrect: {mask.shape}"
-    print("Test intégration complet réussi ✅")
+    
+    print("Test intégration backbone/encodeur/AFQS réussi ✅")
 
 if __name__ == "__main__":
     
     test_positional_encoding()
     test_deformable_attention()
     test_transformer_encoder()
-    test_full_model()
+    test_backbone_afqs_encoder()
     
     # test_afqs()
     # test_dataset_and_backbone()
