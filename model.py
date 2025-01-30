@@ -198,6 +198,11 @@ class MultiHeadAttention(nn.Module):
         return attn_output, attn_weights
 
 class DeformableAttention(nn.Module):
+    """Implémentation de l'attention déformable avec prédiction d'offsets.
+       Shapes :
+         - x : (B, N, D) (entrée sous forme de tokens)
+         - retour : (B, N, D) (tokens après attention)
+    """
     def __init__(self, d_model=256, nhead=8, num_points=4):
         super().__init__()
         self.d_model = d_model
@@ -216,6 +221,13 @@ class DeformableAttention(nn.Module):
         nn.init.constant_(self.attn_pred.bias, 0)
 
     def forward(self, x, H, W):
+        """
+        Args:
+            x : (B, N, D)  -> Entrée (tokens encodeur)
+            H, W : hauteur et largeur de la feature map d'origine
+        Returns:
+            out : (B, N, D)  -> Tokens après attention déformable
+        """
         B, N, D = x.shape
         x_spatial = x.view(B, H, W, D).permute(0, 3, 1, 2)  # [B, D, H, W]
         
