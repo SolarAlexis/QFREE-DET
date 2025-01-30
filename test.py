@@ -646,12 +646,13 @@ def test_backbone_afqs_encoder():
 
 if __name__ == "__main__":
     
+    test_afqs()
+    test_dataset_and_backbone()
+    
     test_positional_encoding()
     test_multihead_attention()
     test_deformable_attention()
     test_transformer_encoder()
     test_backbone_afqs_encoder()
     
-    # test_afqs()
-    # test_dataset_and_backbone()
-    # test_visualization()
+    test_visualization()
