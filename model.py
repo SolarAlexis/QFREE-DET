@@ -90,7 +90,8 @@ class ResNet50Backbone(nn.Module):
 
 
 class PositionalEncoding2D(nn.Module):
-    """Encodage positionnel 2D corrigé pour 640x640"""
+    """Encodage positionnel 2D avec correction de la périodicité"""
+    
     def __init__(self, d_model):
         super().__init__()
         if d_model % 4 != 0:
@@ -102,27 +103,99 @@ class PositionalEncoding2D(nn.Module):
     def forward(self, B, H, W, device):
         pe = torch.zeros(B, H, W, self.d_model, device=device)
         
-        # Calcul des termes de fréquence
+        # 🔹 Normalisation correcte du facteur de fréquence
         div_term = torch.exp(
-            torch.arange(0, self.dim, 1, device=device).float() *
-            (-math.log(10000.0) / self.dim)
-        )
-        
-        # Encodage hauteur -----------------------------------------------------
-        y_pos = torch.arange(H, device=device).float().view(-1, 1, 1)  # [H, 1, 1]
-        y_sin = torch.sin(y_pos * div_term)  # [H, 1, dim]
-        y_cos = torch.cos(y_pos * div_term)  # [H, 1, dim]
-        y_enc = torch.cat([y_sin, y_cos], dim=-1)  # [H, 1, 2*dim]
-        pe[..., :self.d_model//2] = y_enc.expand(-1, W, -1).unsqueeze(0)  # [B, H, W, d_model//2]
+            torch.arange(0, self.dim, device=device, dtype=torch.float32) *
+            (-math.log(10000.0) / (self.dim - 1))
+        )  
 
-        # Encodage largeur -----------------------------------------------------
-        x_pos = torch.arange(W, device=device).float().view(1, -1, 1)  # [1, W, 1]
-        x_sin = torch.sin(x_pos * div_term)  # [1, W, dim]
-        x_cos = torch.cos(x_pos * div_term)  # [1, W, dim]
-        x_enc = torch.cat([x_sin, x_cos], dim=-1)  # [1, W, 2*dim]
-        pe[..., self.d_model//2:] = x_enc.expand(H, -1, -1).unsqueeze(0)  # [B, H, W, d_model//2]
+        # Encodage hauteur (y)
+        y_pos = torch.arange(H, device=device, dtype=torch.float32).unsqueeze(1)  # [H, 1]
+        y_enc = torch.cat([torch.sin(y_pos * div_term), torch.cos(y_pos * div_term)], dim=-1)  # [H, 2*dim]
+        y_enc = y_enc.unsqueeze(1).expand(-1, W, -1).unsqueeze(0)  # [1, H, W, 2*dim]
+        pe[..., :self.d_model//2] = y_enc  # [B, H, W, d_model//2]
+
+        # Encodage largeur (x)
+        x_pos = torch.arange(W, device=device, dtype=torch.float32).unsqueeze(1)  # [W, 1]
+        x_enc = torch.cat([torch.sin(x_pos * div_term), torch.cos(x_pos * div_term)], dim=-1)  # [W, 2*dim]
+        x_enc = x_enc.unsqueeze(0).expand(H, -1, -1).unsqueeze(0)  # [1, H, W, 2*dim]
+        pe[..., self.d_model//2:] = x_enc  # [B, H, W, d_model//2]
 
         return pe
+
+class MultiHeadAttention(nn.Module):
+    """Implémentation manuelle de la multi-head attention (batch first).
+       Shapes:
+         - query, key, value: (B, N, D)
+         - retour: (attn_output, attn_weights) avec
+             * attn_output: (B, N, D)
+             * attn_weights: (B, nhead, N, N) (optionnel si on veut l'extraire)
+    """
+    def __init__(self, d_model, nhead, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.dropout = nn.Dropout(dropout)
+
+        assert d_model % nhead == 0, "d_model doit être divisible par nhead"
+        self.d_k = d_model // nhead  # dimension de chaque tête
+
+        # Projections linéaires pour Q, K, V et la sortie
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+        
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.W_q.weight)
+        nn.init.xavier_uniform_(self.W_k.weight)
+        nn.init.xavier_uniform_(self.W_v.weight)
+        nn.init.xavier_uniform_(self.W_o.weight)
+        nn.init.constant_(self.W_q.bias, 0)
+        nn.init.constant_(self.W_k.bias, 0)
+        nn.init.constant_(self.W_v.bias, 0)
+        nn.init.constant_(self.W_o.bias, 0)
+
+    def forward(self, query, key, value, attn_mask=None):
+        """
+        Args:
+            query, key, value: (B, N, D)
+            attn_mask: (B, nhead, N, N) ou broadcastable si besoin (optionnel)
+        Returns:
+            attn_output: (B, N, D)
+            attn_weights: (B, nhead, N, N) si on veut inspecter l'attention
+        """
+        B, N, _ = query.size()
+
+        # 1. Projection linéaire + découpage en nhead
+        Q = self.W_q(query).view(B, N, self.nhead, self.d_k).transpose(1, 2)  # (B, nhead, N, d_k)
+        K = self.W_k(key).view(B, -1, self.nhead, self.d_k).transpose(1, 2)   # (B, nhead, N, d_k)
+        V = self.W_v(value).view(B, -1, self.nhead, self.d_k).transpose(1, 2) # (B, nhead, N, d_k)
+
+        # 2. Calcul des scores d'attention (scaled dot-product)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)  # (B, nhead, N, N)
+        
+        # 3. Application éventuelle d'un masque
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask == 0, float('-inf'))
+        
+        # 4. Softmax sur la dimension des clés
+        attn_weights = F.softmax(scores, dim=-1)  # (B, nhead, N, N)
+        attn_weights = self.dropout(attn_weights)
+        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
+
+        # 5. Calcul de la sortie pondérée
+        out = torch.matmul(attn_weights, V)  # (B, nhead, N, d_k)
+
+        # 6. Réassemblage des têtes
+        out = out.transpose(1, 2).contiguous().view(B, N, self.d_model)  # (B, N, D)
+
+        # 7. Projection finale
+        attn_output = self.W_o(out)
+
+        return attn_output, attn_weights
 
 class DeformableAttention(nn.Module):
     def __init__(self, d_model=256, nhead=8, num_points=4):
@@ -185,7 +258,7 @@ class TransformerEncoderLayer(nn.Module):
         if attention_type == 'deformable':
             self.self_attn = DeformableAttention(d_model, nhead, num_points)
         else:
-            self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+            self.self_attn = MultiHeadAttention(d_model, nhead, dropout=dropout)
         
         # FFN
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -200,7 +273,7 @@ class TransformerEncoderLayer(nn.Module):
         if self.attention_type == 'deformable':
             src2 = self.self_attn(src, H, W)
         else:
-            src2 = self.self_attn(src, src, src)[0]
+            src2, _ = self.self_attn(src, src, src)  # (B, N, D)
         
         # Residual + Norm
         src = src + self.dropout(src2)

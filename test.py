@@ -3,9 +3,11 @@ from PIL import Image
 import copy
 
 import torch
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import math
 
-from model import AFQS, ResNet50Backbone, PositionalEncoding2D, DeformableAttention, TransformerEncoder, QFreeDet
+from model import AFQS, ResNet50Backbone, PositionalEncoding2D, DeformableAttention, TransformerEncoder, MultiHeadAttention
 from dataset import train_dataset, train_loader, train_ann_data, transform, train_dir, show_image_with_boxes
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -359,87 +361,293 @@ def test_visualization():
     plt.show()
     
     print("Test 6 (Visualisation) réussi ✅")
-
+    
 def test_positional_encoding():
-    """Teste l'encodage positionnel 2D"""
-    # 1. Initialisation
+    # 1) Création de l'instance
     d_model = 256
     pe = PositionalEncoding2D(d_model)
-    B, H, W = 2, 20, 20
+    B, H, W = 2, 10, 10  # batch=2, hauteur=10, largeur=10
     
-    # 2. Exécution
-    encoding = pe(B, H, W, torch.device('cpu'))
+    # 2) Passage forward
+    encoding = pe(B, H, W, device=torch.device('cpu'))
     
-    # 3. Vérifications
-    assert encoding.shape == (B, H, W, d_model), f"Mauvaise shape: {encoding.shape}"
-    assert not torch.allclose(encoding[0,0,0], encoding[0,1,0]), "Encodage vertical manquant"
-    assert not torch.allclose(encoding[0,0,0], encoding[0,0,1]), "Encodage horizontal manquant"
-    print("Test PositionalEncoding2D réussi ✅")
+    # 3) Vérification de la forme
+    assert encoding.shape == (B, H, W, d_model), (
+        f"Forme attendue: {(B, H, W, d_model)}, forme obtenue: {encoding.shape}"
+    )
+    
+    # 4) Vérification que l'encodage varie selon la hauteur et la largeur
+    # Vérif. variation verticale
+    assert not torch.allclose(encoding[0, 0, 0], encoding[0, 1, 0]), (
+        "Les encodages à 2 hauteurs différentes sont identiques, "
+        "l'encodage vertical ne varie pas."
+    )
+    # Vérif. variation horizontale
+    assert not torch.allclose(encoding[0, 0, 0], encoding[0, 0, 1]), (
+        "Les encodages à 2 largeurs différentes sont identiques, "
+        "l'encodage horizontal ne varie pas."
+    )
+
+    # 5) Vérification sur 2 positions aléatoires
+    # (pour s'assurer que l'encodage n'est pas uniforme ou constant)
+    pos1 = (0, 2, 3)  # Batch=0, Y=2, X=3
+    pos2 = (0, 5, 7)  # Batch=0, Y=5, X=7
+    assert not torch.allclose(encoding[pos1], encoding[pos2]), (
+        f"Les encodages aux positions {pos1} et {pos2} sont identiques, "
+        "alors qu'ils devraient différer."
+    )
+    
+    # 6) Cas limite : 1×1 (vérifier que la forme et l'appel fonctionnent)
+    encoding_1x1 = pe(1, 1, 1, device=torch.device('cpu'))
+    assert encoding_1x1.shape == (1, 1, 1, d_model), (
+        f"Forme attendue pour (1,1): {(1, 1, 1, d_model)}, "
+        f"forme obtenue: {encoding_1x1.shape}"
+    )
+    
+    print("Test positional_encoding réussi ✅")
+
+def test_multihead_attention():
+    """Teste le module MultiHeadAttention sur différentes dimensions et vérifie
+       - la forme de la sortie,
+       - la normalisation des poids d'attention,
+       - la rétropropagation,
+       - éventuellement le fonctionnement d'un masque.
+    """
+    d_model = 256
+    nhead = 8
+    layer = MultiHeadAttention(d_model, nhead=nhead, dropout=0.1)
+
+    # On teste plusieurs combinaisons (batch_size, seq_len)
+    for (B, N) in [(2, 10), (4, 20), (1, 5)]:
+        # 1. Création de tenseurs random
+        query = torch.randn(B, N, d_model, requires_grad=True)
+        key   = torch.randn(B, N, d_model, requires_grad=True)
+        value = torch.randn(B, N, d_model, requires_grad=True)
+
+        # 2. Forward pass (sans masque)
+        attn_output, attn_weights = layer(query, key, value)
+
+        # 3. Vérification des formes
+        assert attn_output.shape == (B, N, d_model), (
+            f"Échec shape attn_output: {attn_output.shape}, attendu={(B, N, d_model)}"
+        )
+        assert attn_weights.shape == (B, nhead, N, N), (
+            f"Échec shape attn_weights: {attn_weights.shape}, attendu={(B, nhead, N, N)}"
+        )
+
+        # 4. Vérification que la somme des poids d'attention = 1 (axe -1)
+        with torch.no_grad():
+            somme = attn_weights.sum(dim=-1)  # (B, nhead, N)
+            ones = torch.ones_like(somme)
+            assert torch.all(torch.isclose(somme, ones, atol=1e-3)), (
+                f"Erreur : Différence max = {torch.abs(somme - ones).max().item()}"
+            )
+
+        # 5. Vérification de la rétropropagation (aucune erreur ne doit être levée)
+        loss = attn_output.mean()
+        loss.backward()
+
+    # 6. Test optionnel avec un masque (par ex. masque triangulaire causal)
+    #    On crée un masque binaire de taille (N, N) qu'on broadcast sur (B, nhead, N, N).
+    B, N = 2, 5
+    causal_mask = torch.tril(torch.ones(N, N, dtype=torch.bool))  # bas-triangulaire
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(B, nhead, N, N)  # (B, nhead, N, N)
+
+    query = torch.randn(B, N, d_model, requires_grad=True)
+    key   = torch.randn(B, N, d_model, requires_grad=True)
+    value = torch.randn(B, N, d_model, requires_grad=True)
+
+    attn_output, attn_weights = layer(query, key, value, attn_mask=causal_mask)
+    assert attn_output.shape == (B, N, d_model), "Erreur de shape avec masque causal."
+
+    loss = attn_output.mean()
+    loss.backward()  # test de backprop
+
+    print("Test MultiHeadAttention réussi ✅")
 
 def test_deformable_attention():
-    """Teste le module d'attention déformable avec dimensions corrigées"""
-    B, H, W, D = 2, 20, 20, 256
-    layer = DeformableAttention(D, nhead=8, num_points=4)
-    x = torch.randn(B, H*W, D)
+    """Teste le module d'attention déformable avec dimensions corrigées + validations."""
     
-    output = layer(x, H, W)
-    
-    assert output.shape == (B, H*W, D), f"Shape sortie: {output.shape}"
+    # 1. Création du module
+    d_model = 256
+    nhead = 8
+    num_points = 4
+    layer = DeformableAttention(d_model, nhead=nhead, num_points=num_points)
+
+    # 2. Test sur différentes tailles de feature map
+    for (B, H, W) in [(2, 20, 20), (2, 10, 25), (1, 5, 5)]:
+        N = H * W  # Nombre total de pixels
+        x = torch.randn(B, N, d_model, requires_grad=True)  # On autorise la backprop
+
+        # 3. Forward pass
+        output = layer(x, H, W)
+
+        # 4. Vérification de la forme
+        assert output.shape == (B, N, d_model), (
+            f"Échec shape: sortie={output.shape} attendu={(B, N, d_model)} "
+            f"pour B={B}, H={H}, W={W}."
+        )
+
+        # 5. Vérification des offsets
+        with torch.no_grad():
+            x_spatial = x.view(B, H, W, d_model).permute(0, 3, 1, 2)  # [B, D, H, W]
+            offsets = layer.offset_pred(x_spatial).view(B, nhead, num_points, 2, H, W)
+            
+            assert offsets.abs().max() < 1.0, "Offsets trop grands, peut être instable."
+
+        # 6. Vérification de la normalisation des poids d'attention
+        with torch.no_grad():
+            attn = layer.attn_pred(x_spatial).view(B, nhead, num_points, H, W)
+            attn_softmax = F.softmax(attn, dim=2)
+            assert torch.allclose(attn_softmax.sum(dim=2), torch.ones_like(attn_softmax.sum(dim=2)), atol=1e-3), (
+                "Les poids d'attention ne sont pas normalisés (softmax incorrect)."
+            )
+
+        # 7. Test de la rétropropagation
+        loss = output.mean()
+        loss.backward()  # Vérifie qu'aucune erreur n'est levée
+        
     print("Test DeformableAttention réussi ✅")
     
 def test_transformer_encoder():
-    """Teste l'encodeur Transformer complet"""
-    # 1. Configuration
-    encoder = TransformerEncoder(
-        d_model=256,
-        nhead=8,
-        num_layers=2,
-        attention_type='deformable',
-        num_points=4
-    )
+    """Teste l'encodeur Transformer complet, avec plusieurs configs:
+       - Différents batch sizes
+       - Différentes résolutions
+       - Deux types d'attention (déformable / multihead)
+       - Verification de la forme de sortie et de la backprop
+    """
+    # On veut tester 2 types d'attention
+    attention_types = ['deformable', 'multihead']
+    # On veut tester plusieurs (B, H, W)
+    test_configs = [
+        (1, 5, 5),
+        (2, 20, 20),
+        (4, 10, 25),
+    ]
     
-    # 2. Données test (sortie backbone)
-    c5 = torch.randn(2, 2048, 20, 20)  # Shape typique pour entrée 640x640
-    
-    # 3. Forward pass
-    encoder_tokens = encoder(c5)
-    
-    # 4. Vérifications
-    assert encoder_tokens.shape == (2, 400, 256), f"Shape tokens incorrect: {encoder_tokens.shape}"
-    print("Test TransformerEncoder réussi ✅")
+    for attn_type in attention_types:
+        # Création d'un encodeur avec 2 couches
+        encoder = TransformerEncoder(
+            d_model=256,
+            nhead=8,
+            num_layers=2,
+            dim_feedforward=1024,
+            dropout=0.1,
+            attention_type=attn_type,
+            num_points=4
+        )
+
+        # Test sur plusieurs batch / résolutions
+        for (B, H, W) in test_configs:
+            
+            # Simule une sortie backbone (ex: ResNet)
+            # 2048 channels correspond à la sortie "C5" dans ResNet50/101
+            c5 = torch.randn(B, 2048, H, W, requires_grad=True)
+            
+            # Forward pass
+            encoder_tokens = encoder(c5)
+            
+            # On s'attend à (B, H*W, 256)
+            assert encoder_tokens.shape == (B, H*W, 256), (
+                f"Shape tokens incorrect: {encoder_tokens.shape}, "
+                f"attendu={(B, H*W, 256)}"
+            )
+
+            # Test de rétropropagation: on calcule une pseudo-loss et on backward
+            loss = encoder_tokens.mean()
+            loss.backward()  # aucune erreur ne doit être levée
+
+    print("Test TransformerEncoder (layers + encoder) réussi ✅")
 
 def test_backbone_afqs_encoder():
-    """Test d'intégration entre backbone, encodeur et AFQS"""
-    # 1. Initialisation
+    """Test d'intégration pour backbone, encodeur et AFQS sans passer par QFreeDet."""
+    # ------------------------------------------------------------------
+    # 1. Initialisation des modules
+    # ------------------------------------------------------------------
     backbone = ResNet50Backbone()
     encoder = TransformerEncoder()
-    afqs = AFQS(max_pool_size=100)
-    
-    # 2. Données test
-    x = torch.randn(2, 3, 640, 640)
-    
-    # 3. Forward pass étape par étape
-    # a) Backbone
+    afqs = AFQS(max_pool_size=100)  # On limite à 100 pour le test
+
+    # ------------------------------------------------------------------
+    # 2. Données de test
+    # ------------------------------------------------------------------
+    batch_size = 2
+    x = torch.randn(batch_size, 3, 640, 640)  # Images 640x640
+
+    # ------------------------------------------------------------------
+    # 3. Vérification de la sortie du backbone
+    # ------------------------------------------------------------------
     features = backbone(x)
-    c5 = features[-1]  # Dernière feature map [B, 2048, 20, 20]
+    assert len(features) == 4, (
+        "Le backbone doit renvoyer 4 niveaux de features (c2, c3, c4, c5)."
+    )
+    c2, c3, c4, c5 = features
+
+    # Pour une image 640x640, on s'attend à :
+    # c2: 1/4  -> (B, 256, 160, 160)
+    # c3: 1/8  -> (B, 512, 80, 80)
+    # c4: 1/16 -> (B, 1024, 40, 40)
+    # c5: 1/32 -> (B, 2048, 20, 20)
+    assert c2.shape == (batch_size, 256, 160, 160), f"Shape de c2 incorrect: {c2.shape}"
+    assert c3.shape == (batch_size, 512, 80, 80),   f"Shape de c3 incorrect: {c3.shape}"
+    assert c4.shape == (batch_size, 1024, 40, 40),  f"Shape de c4 incorrect: {c4.shape}"
+    assert c5.shape == (batch_size, 2048, 20, 20),  f"Shape de c5 incorrect: {c5.shape}"
+
+    # ------------------------------------------------------------------
+    # 4. Vérification de la sortie de l'encodeur
+    # ------------------------------------------------------------------
+    encoder_tokens = encoder(c5)  # [B, N, D] = [2, 400, 256] normalement
+    assert encoder_tokens.shape == (batch_size, 400, 256), (
+        f"Shape de la sortie de l'encodeur incorrecte: {encoder_tokens.shape}"
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Test du module AFQS en mode entraînement
+    # ------------------------------------------------------------------
+    sadq_train, mask_train = afqs(encoder_tokens)
     
-    # b) Encodeur
-    encoder_tokens = encoder(c5)  # [B, 400, 256]
-    
-    # c) AFQS
-    sadq, mask = afqs(encoder_tokens)
-    
-    # 4. Vérifications
-    assert c5.shape == (2, 2048, 20, 20), f"Shape backbone output incorrect: {c5.shape}"
-    assert encoder_tokens.shape == (2, 400, 256), f"Shape encoder output incorrect: {encoder_tokens.shape}"
-    assert sadq.shape == (2, 100, 256), f"Shape SADQ incorrect: {sadq.shape}"
-    assert mask.shape == (2, 400), f"Shape mask incorrect: {mask.shape}"
-    
-    print("Test intégration backbone/encodeur/AFQS réussi ✅")
+    # Par défaut, en entraînement, la taille de SADQ devrait être [B, max_pool_size, D]
+    # si des tokens sont sélectionnés (ou padding). Ici max_pool_size=100.
+    assert sadq_train.shape == (batch_size, 100, 256), (
+        f"Shape SADQ en mode entraînement incorrecte: {sadq_train.shape}"
+    )
+    assert mask_train.shape == (batch_size, 400), (
+        f"Shape du masque de sélection incorrecte: {mask_train.shape}"
+    )
+    assert mask_train.dtype == torch.bool, (
+        f"Le masque de sélection doit être booléen, obtenu: {mask_train.dtype}"
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Test du module AFQS en mode évaluation (inférence)
+    # ------------------------------------------------------------------
+    afqs.eval()  # Mode inférence
+    with torch.no_grad():
+        sadq_eval, mask_eval = afqs(encoder_tokens)
+
+    # En inférence, AFQS renvoie une liste de tenseurs de taille variable
+    # (un par image), ou un "collate" identique si on l’a implémenté différemment.
+    # Dans le code actuel, c'est plutôt un list comprehension:
+    #   SADQ = [encoder_tokens[b, selection_mask[b]] ...]
+    # Donc on s'attend à une liste de length B.
+    assert isinstance(sadq_eval, list), (
+        "En mode inference, AFQS devrait renvoyer une liste de tenseurs."
+    )
+    assert len(sadq_eval) == batch_size, (
+        f"En mode inférence, la liste renvoyée doit avoir {batch_size} éléments."
+    )
+    # Vérifions que la forme [N_i, D] est respectée pour chaque sous-tenseur
+    for i, queries in enumerate(sadq_eval):
+        assert queries.ndim == 2 and queries.shape[-1] == 256, (
+            f"SADQ inférence (batch {i}) doit être [N_i, 256], obtenu {queries.shape}"
+        )
+
+    print("Test d'intégration (backbone / encodeur / AFQS) réussi ✅")
 
 if __name__ == "__main__":
     
     test_positional_encoding()
+    test_multihead_attention()
     test_deformable_attention()
     test_transformer_encoder()
     test_backbone_afqs_encoder()
