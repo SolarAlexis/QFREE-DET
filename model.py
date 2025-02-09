@@ -5,50 +5,73 @@ import torch.nn.functional as F
 import math
 
 from config import params
+
 class AFQS(nn.Module):
-    def __init__(self, threshold=params["AFQS_threshold"], max_pool_size=params["AFQS_max_pool_size"], num_classes=80, feature_dim=256):
+    def __init__(self, 
+                 threshold=params["AFQS_threshold"], 
+                 max_pool_size=params["AFQS_max_pool_size"], 
+                 num_classes=80, 
+                 feature_dim=256,
+                 tau=params["AFQS_temperature"]):  # température pour la relaxation
         super().__init__()
         self.S = threshold
+        self.tau = tau
         self.class_head = nn.Linear(feature_dim, num_classes)
         self.P = max_pool_size
 
     def forward(self, encoder_tokens):
+        """
+        encoder_tokens: Tensor de forme [B, N, D]
+        Retourne :
+          - SADQ: tensor de requêtes alignées (selon que l'on soit en entraînement ou inférence)
+          - selection_mask: masque (float) indiquant la sélection (valeurs proches de 1 pour sélectionné)
+        """
         B, N, D = encoder_tokens.shape
-        class_logits = self.class_head(encoder_tokens)
-        class_scores = torch.sigmoid(class_logits).max(dim=-1).values
-        selection_mask = class_scores > self.S
+
+        # 1. Calcul de la sortie de la tête linéaire et du score
+        class_logits = self.class_head(encoder_tokens)  # [B, N, num_classes]
+        # On combine par max sur la dimension classes après sigmoïde
+        class_scores = torch.sigmoid(class_logits).max(dim=-1).values  # [B, N]
+
+        # 2. Calcul d'un masque différentiable
+        # Masque doux (continuous) : plus la température est petite, plus il se rapproche d'un seuil
+        soft_mask = torch.sigmoid((class_scores - self.S) / self.tau)
+        # Masque dur (binaire) : pour la logique de sélection
+        hard_mask = (class_scores > self.S).float()
+        # Straight-through estimator : en forward on a le hard_mask, en backward on passe par soft_mask.
+        selection_mask = hard_mask + soft_mask - soft_mask.detach()
 
         if self.training:
-            # Étape 1: Calculer le nombre de requêtes valides par image
+            # Pour l'entraînement, on souhaite un nombre fixe de requêtes par image.
+            # On utilise ici le hard_mask pour définir les indices.
             num_valid_list = []
             for b in range(B):
-                valid_indices = torch.where(selection_mask[b])[0]
+                valid_indices = torch.where(hard_mask[b] > 0)[0]
                 num_valid_list.append(len(valid_indices))
             
-            # Étape 2: Déterminer N_query_b (taille commune du batch)
+            # Déterminer N_query_b (nombre de requêtes pour le batch)
             N_query_b = min(max(num_valid_list), self.P) if max(num_valid_list) > 0 else self.P
 
-            # Étape 3: Aligner toutes les requêtes à N_query_b
             aligned_queries = []
             for b in range(B):
-                valid_indices = torch.where(selection_mask[b])[0]
-                num_valid = num_valid_list[b]
+                valid_indices = torch.where(hard_mask[b] > 0)[0]
+                num_valid = len(valid_indices)
                 
-                # Sélection des tokens valides
+                # Sélection des tokens valides (utilise le hard_mask pour la sélection effective)
                 selected = encoder_tokens[b, valid_indices] if num_valid > 0 else torch.zeros((0, D), device=encoder_tokens.device)
                 
                 padding_needed = N_query_b - num_valid
-                available_padding = N - num_valid  # Tokens non sélectionnés disponibles
-
+                available_padding = N - num_valid  # tokens non sélectionnés
+                
                 if padding_needed > 0:
                     if available_padding > 0:
-                        # Sélection des pires tokens non valides
+                        # Sélection des pires tokens (ceux avec de faibles scores) parmi les non sélectionnés
                         worst = class_scores[b].topk(min(padding_needed, available_padding), largest=False).indices
                         padding_tokens = encoder_tokens[b, worst]
                     else:
                         padding_tokens = torch.zeros((0, D), device=encoder_tokens.device)
                     
-                    # Compléter avec des zéros si nécessaire
+                    # Si besoin, compléter avec des zéros
                     remaining_padding = padding_needed - len(padding_tokens)
                     if remaining_padding > 0:
                         zero_pad = torch.zeros((remaining_padding, D), device=encoder_tokens.device)
@@ -56,15 +79,19 @@ class AFQS(nn.Module):
                     
                     aligned = torch.cat([selected, padding_tokens], dim=0)
                 else:
-                    aligned = selected[:N_query_b]  # Troncature (cas rare)
+                    aligned = selected[:N_query_b]  # en cas de surplus (rare)
                 
                 aligned_queries.append(aligned)
             
-            SADQ = torch.stack(aligned_queries, dim=0)  # Shape: [B, N_query_b, D]
+            # On additionne (via un dummy) pour s'assurer que le chemin de gradient remonte bien jusqu'à class_logits.
+            # Bien que les opérations d'indexation soient non différentiables, le terme soft_mask permet de faire remonter
+            # un signal jusqu'à la tête linéaire.
+            dummy = class_logits.sum() * 0.0
+            SADQ = torch.stack(aligned_queries, dim=0) + dummy  # [B, N_query_b, D]
         
         else:
-            # Mode inférence: requêtes variables
-            SADQ = [encoder_tokens[b, torch.where(selection_mask[b])[0]] for b in range(B)]
+            # En mode inférence, on retourne les requêtes avec une sélection dure
+            SADQ = [encoder_tokens[b, torch.where(hard_mask[b] > 0)[0]] for b in range(B)]
         
         return SADQ, selection_mask
     

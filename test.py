@@ -18,29 +18,27 @@ def test_afqs():
 
     # ----------------------------------------------------------------------
     # Cas 1: Entraînement - Max des requêtes valides (50) < max_pool_size (100)
-    # Résultat: N_query_b = 50
+    # Résultat attendu : N_query_b = 50
     # ----------------------------------------------------------------------
-    model = AFQS(threshold=0.5, max_pool_size=100).to(device)
+    model = AFQS(threshold=0.5, max_pool_size=100, feature_dim=feature_dim).to(device)
     model.train()
 
-    # Contrôler le class_head pour que les scores soient prédictibles
+    # Contrôler le class_head pour obtenir des scores prévisibles
     with torch.no_grad():
         model.class_head.weight.data.zero_()  # Désactiver tous les poids
         model.class_head.bias.data.zero_()    # Désactiver le biais
-        model.class_head.weight.data[0, :] = 1.0  # Classe 0 = somme des features
+        model.class_head.weight.data[0, :] = 1.0  # Pour la classe 0 : somme des features
 
-    # Créer un batch avec [30, 50, 10] requêtes valides
-    encoder_tokens = torch.zeros(3, 200, feature_dim, device=device)  # Initialiser à zéro
+    # Créer un batch avec 3 images et 200 tokens par image
+    # Image 0: 30 tokens "valides" (valeur 10.0) puis 170 tokens invalides (-10.0)
+    # Image 1: 50 tokens valides, puis invalides
+    # Image 2: 10 tokens valides, puis invalides
+    encoder_tokens = torch.zeros(3, 200, feature_dim, device=device)
     with torch.no_grad():
-        # Image 0: 30 tokens valides, reste invalides
-        encoder_tokens[0, :30] = 10.0   # Scores élevés (classe 0 = 10.0 * 256 = 2560)
-        encoder_tokens[0, 30:] = -10.0  # Scores bas (classe 0 = -10.0 * 256 = -2560)
-        
-        # Image 1: 50 tokens valides, reste invalides
+        encoder_tokens[0, :30] = 10.0
+        encoder_tokens[0, 30:] = -10.0
         encoder_tokens[1, :50] = 10.0
         encoder_tokens[1, 50:] = -10.0
-        
-        # Image 2: 10 tokens valides, reste invalides
         encoder_tokens[2, :10] = 10.0
         encoder_tokens[2, 10:] = -10.0
 
@@ -50,15 +48,15 @@ def test_afqs():
 
     # ----------------------------------------------------------------------
     # Cas 2: Entraînement - Max des requêtes valides (200) > max_pool_size (100)
-    # Résultat: N_query_b = 100
+    # Résultat attendu : N_query_b = 100
     # ----------------------------------------------------------------------
-    model = AFQS(threshold=0.5, max_pool_size=100).to(device)
+    model = AFQS(threshold=0.5, max_pool_size=100, feature_dim=feature_dim).to(device)
     model.train()
 
     encoder_tokens = torch.randn(2, 300, feature_dim, device=device)
     with torch.no_grad():
-        encoder_tokens[0, :200] += 10.0  # 200 valides (dépassement)
-        encoder_tokens[1, :50] += 10.0   # 50 valides
+        encoder_tokens[0, :200] += 10.0  # 200 tokens valides
+        encoder_tokens[1, :50] += 10.0   # 50 tokens valides
 
     SADQ, _ = model(encoder_tokens)
     assert SADQ.shape[1] == 100, f"Cas 2 échoué: {SADQ.shape} != (2, 100, 256)"
@@ -66,56 +64,54 @@ def test_afqs():
 
     # ----------------------------------------------------------------------
     # Cas 3: Entraînement - Aucun token valide (remplissage avec des zéros)
-    # Résultat: N_query_b = max_pool_size
+    # Résultat attendu : N_query_b = max_pool_size (100)
     # ----------------------------------------------------------------------
-    model = AFQS(threshold=1.0, max_pool_size=100).to(device)
+    model = AFQS(threshold=1.0, max_pool_size=100, feature_dim=feature_dim).to(device)
     model.train()
 
-    # Forcer tous les scores à être < 1.0
-    encoder_tokens = torch.randn(2, 50, feature_dim, device=device) * 0.1  # Scores bas
-
+    # Forcer tous les scores à être faibles (< 1.0)
+    encoder_tokens = torch.randn(2, 50, feature_dim, device=device) * 0.1
     SADQ, _ = model(encoder_tokens)
-    assert SADQ.shape == (2, 100, feature_dim), f"Échec: {SADQ.shape} != (2, 100, 256)"
+    assert SADQ.shape == (2, 100, feature_dim), f"Cas 3 échoué: {SADQ.shape} != (2, 100, 256)"
     print("Cas 3 (Aucun token valide) réussi ✅")
 
     # ----------------------------------------------------------------------
     # Cas 4: Inférence - Requêtes variables
-    # Résultat: List[Tensor] de tailles différentes
+    # Résultat attendu : une liste de tenseurs de tailles variables
     # ----------------------------------------------------------------------
-    model = AFQS(threshold=0.5).to(device)
+    model = AFQS(threshold=0.5, feature_dim=feature_dim).to(device)
     model.eval()
 
-    # Contrôler le class_head pour des scores prédictibles
+    # Contrôler le class_head pour obtenir des scores prévisibles
     with torch.no_grad():
         model.class_head.weight.data.zero_()
         model.class_head.bias.data.zero_()
-        model.class_head.weight.data[0, :] = 1.0  # Classe 0 = somme des features
+        model.class_head.weight.data[0, :] = 1.0
 
     encoder_tokens = torch.zeros(2, 100, feature_dim, device=device)
     with torch.no_grad():
-        encoder_tokens[0, :30] = 10.0  # Scores élevés
-        encoder_tokens[0, 30:] = -10.0 # Scores bas
-        encoder_tokens[1, :60] = 10.0
+        encoder_tokens[0, :30] = 10.0  # 30 tokens valides
+        encoder_tokens[0, 30:] = -10.0
+        encoder_tokens[1, :60] = 10.0  # 60 tokens valides
         encoder_tokens[1, 60:] = -10.0
 
     SADQ, selection_mask = model(encoder_tokens)
-    assert isinstance(SADQ, list), "Erreur: SADQ doit être une liste en inférence"
+    assert isinstance(SADQ, list), "Erreur: En mode inférence, SADQ doit être une liste"
     assert SADQ[0].shape == (30, feature_dim), f"Image 0: {SADQ[0].shape} != (30, 256)"
     assert SADQ[1].shape == (60, feature_dim), f"Image 1: {SADQ[1].shape} != (60, 256)"
     print("Cas 4 (Inférence variable) réussi ✅")
-    
+
     # ----------------------------------------------------------------------
     # Cas 5: Entraînement - Nombre valide (150) > max_pool_size (100)
-    # Résultat: Troncature à P=100 et remplissage correct
+    # Résultat attendu : troncature à P=100 et remplissage correct
     # ----------------------------------------------------------------------
-    model = AFQS(threshold=0.5, max_pool_size=100).to(device)
+    model = AFQS(threshold=0.5, max_pool_size=100, feature_dim=feature_dim).to(device)
     model.train()
 
-    # Créer un batch avec [150, 50] requêtes valides
     encoder_tokens = torch.zeros(2, 200, feature_dim, device=device)
     with torch.no_grad():
-        # Image 0: 150 tokens valides
-        encoder_tokens[0, :150] = 10.0  # Top 100 seront gardés
+        # Image 0: 150 tokens valides (les 100 premiers doivent être gardés)
+        encoder_tokens[0, :150] = 10.0
         encoder_tokens[0, 150:] = -10.0
         
         # Image 1: 50 tokens valides
@@ -123,31 +119,24 @@ def test_afqs():
         encoder_tokens[1, 50:] = -10.0
 
     SADQ, _ = model(encoder_tokens)
-    
-    # Vérifier la forme
     assert SADQ.shape == (2, 100, feature_dim), f"Cas 5 échoué: {SADQ.shape} != (2, 100, 256)"
-    
-    # Vérifier la troncature pour l'image 0 (doit garder les 100 premiers des 150 valides)
-    assert torch.all(SADQ[0] == 10.0), "Erreur troncature top tokens valides"
-    
-    # Vérifier le remplissage pour l'image 1 (50 valides + 50 pires non-valides)
-    assert torch.all(SADQ[1, :50] == 10.0), "Erreur partie valide image 1"
-    assert torch.all(SADQ[1, 50:] == -10.0), "Erreur remplissage image 1"
-    
+    # Pour l'image 0, on attend que les 100 tokens retenus soient ceux valides (10.0)
+    assert torch.all(SADQ[0] == 10.0), "Cas 5 erreur: image 0, troncature incorrecte"
+    # Pour l'image 1, les 50 tokens valides (10.0) suivis de 50 tokens remplissant avec les pires (-10.0)
+    assert torch.all(SADQ[1, :50] == 10.0), "Cas 5 erreur: image 1, partie valide incorrecte"
+    assert torch.all(SADQ[1, 50:] == -10.0), "Cas 5 erreur: image 1, remplissage incorrect"
     print("Cas 5 (Troncature valide > P) réussi ✅")
-    
+
     # ----------------------------------------------------------------------
-    # Cas 6: Entraînement - Un mix exact de P et sous-P dans le même batch
-    # Vérifie le cas où une image a exactement P tokens valides
-    # et l'autre en a moins, nécessitant un padding précis
+    # Cas 6: Entraînement - Mix de cas : une image avec exactement P tokens valides, l'autre moins
+    # Résultat attendu : padding correct pour l'image avec moins de tokens valides
     # ----------------------------------------------------------------------
-    model = AFQS(threshold=0.5, max_pool_size=100).to(device)
+    model = AFQS(threshold=0.5, max_pool_size=100, feature_dim=feature_dim).to(device)
     model.train()
 
-    # Créer un batch avec [100, 30] requêtes valides
     encoder_tokens = torch.zeros(2, 150, feature_dim, device=device)
     with torch.no_grad():
-        # Image 0: 100 tokens valides (exactement P)
+        # Image 0: exactement 100 tokens valides
         encoder_tokens[0, :100] = 10.0
         encoder_tokens[0, 100:] = -10.0
         
@@ -156,50 +145,43 @@ def test_afqs():
         encoder_tokens[1, 30:] = -10.0
 
     SADQ, _ = model(encoder_tokens)
-    
-    # Vérifier la forme
     assert SADQ.shape == (2, 100, feature_dim), f"Cas 6 échoué: {SADQ.shape} != (2, 100, 256)"
-    
-    # Vérifier l'image 0 (exactement P tokens valides, pas de padding)
-    assert torch.all(SADQ[0] == 10.0), "Erreur: Image 0 devrait avoir 100 tokens valides exactement"
-    
-    # Vérifier l'image 1 (30 valides + 70 pires non-valides)
-    assert torch.all(SADQ[1, :30] == 10.0), "Erreur partie valide image 1"
-    assert torch.all(SADQ[1, 30:100] == -10.0), "Erreur padding image 1"
-    
+    # Image 0 : exactement 100 tokens valides
+    assert torch.all(SADQ[0] == 10.0), "Cas 6 erreur: image 0 doit contenir 100 tokens valides"
+    # Image 1 : 30 tokens valides puis 70 tokens remplis par les pires (-10.0)
+    assert torch.all(SADQ[1, :30] == 10.0), "Cas 6 erreur: image 1, partie valide incorrecte"
+    assert torch.all(SADQ[1, 30:100] == -10.0), "Cas 6 erreur: image 1, padding incorrect"
     print("Cas 6 (Mix exact P/sous-P) réussi ✅")
 
     # ----------------------------------------------------------------------
-    # Cas 7: Vérification du flux de gradient complet avec classification loss
+    # Cas 7: Vérification du flux de gradient complet via une loss de classification
     # ----------------------------------------------------------------------
-    model = AFQS(threshold=0.3, max_pool_size=50).to(device)
+    model = AFQS(threshold=0.3, max_pool_size=50, feature_dim=feature_dim).to(device)
     model.train()
 
-    # Créer des données avec gradient et étiquettes factices
+    # Créer des données avec gradient et des labels fictifs
     encoder_tokens = torch.randn(2, 100, feature_dim, device=device, requires_grad=True)
-    dummy_labels = torch.randint(0, 80, (2, 100), device=device)  # Étiquettes aléatoires
+    dummy_labels = torch.randint(0, 80, (2, 100), device=device)
 
-    # Forward pass
+    # Passe forward
     SADQ, _ = model(encoder_tokens)
     class_logits = model.class_head(encoder_tokens)  # [B, N, num_classes]
 
-    # Calculer une loss combinée : somme des SADQ + perte de classification
+    # Calculer une loss combinée (pour tester la rétropropagation)
     loss_sadq = SADQ.sum() * 0.1
-    loss_class = torch.nn.functional.cross_entropy(
+    loss_class = F.cross_entropy(
         class_logits.view(-1, model.class_head.out_features), 
         dummy_labels.view(-1),
-        ignore_index=-1  # Ignorer les tokens non valides si nécessaire
+        ignore_index=-1  # Au cas où
     )
     total_loss = loss_sadq + loss_class
 
-    # Backward pass
     total_loss.backward()
 
-    # Vérifier les gradients
+    # Vérifier que les gradients sont bien remontés
     assert encoder_tokens.grad is not None, "Gradient manquant pour encoder_tokens"
     assert model.class_head.weight.grad is not None, "Gradient manquant pour class_head.weight"
     assert model.class_head.bias.grad is not None, "Gradient manquant pour class_head.bias"
-
     print("Cas 7 (Flux de gradient complet) réussi ✅")
 
 def test_dataset_and_backbone():
@@ -606,45 +588,40 @@ def test_backbone_afqs_encoder():
     # ------------------------------------------------------------------
     sadq_train, mask_train = afqs(encoder_tokens)
     
-    # Par défaut, en entraînement, la taille de SADQ devrait être [B, max_pool_size, D]
-    # si des tokens sont sélectionnés (ou padding). Ici max_pool_size=100.
+    # En entraînement, la taille de SADQ devrait être [B, max_pool_size, D] (ici, 100)
     assert sadq_train.shape == (batch_size, 100, 256), (
         f"Shape SADQ en mode entraînement incorrecte: {sadq_train.shape}"
     )
+    # Le masque de sélection doit conserver la forme [B, N] avec N le nombre de tokens de l'encodeur
     assert mask_train.shape == (batch_size, 400), (
         f"Shape du masque de sélection incorrecte: {mask_train.shape}"
     )
-    assert mask_train.dtype == torch.bool, (
-        f"Le masque de sélection doit être booléen, obtenu: {mask_train.dtype}"
+    # Dans la nouvelle version, le masque est un tenseur float différentiable (et non booléen)
+    assert mask_train.dtype in (torch.float32, torch.float64), (
+        f"Le masque de sélection doit être de type float, obtenu: {mask_train.dtype}"
     )
 
     # ------------------------------------------------------------------
     # 6. Test du module AFQS en mode évaluation (inférence)
     # ------------------------------------------------------------------
-    afqs.eval()  # Mode inférence
+    afqs.eval()  # Passage en mode inférence
     with torch.no_grad():
         sadq_eval, mask_eval = afqs(encoder_tokens)
 
-    # En inférence, AFQS renvoie une liste de tenseurs de taille variable
-    # (un par image), ou un "collate" identique si on l’a implémenté différemment.
-    # Dans le code actuel, c'est plutôt un list comprehension:
-    #   SADQ = [encoder_tokens[b, selection_mask[b]] ...]
-    # Donc on s'attend à une liste de length B.
+    # En mode inférence, AFQS renvoie une liste de tenseurs de tailles variables
     assert isinstance(sadq_eval, list), (
         "En mode inference, AFQS devrait renvoyer une liste de tenseurs."
     )
     assert len(sadq_eval) == batch_size, (
         f"En mode inférence, la liste renvoyée doit avoir {batch_size} éléments."
     )
-    # Vérifions que la forme [N_i, D] est respectée pour chaque sous-tenseur
+    # Vérification que pour chaque image, la forme [N_i, D] est respectée
     for i, queries in enumerate(sadq_eval):
         assert queries.ndim == 2 and queries.shape[-1] == 256, (
             f"SADQ inférence (batch {i}) doit être [N_i, 256], obtenu {queries.shape}"
         )
 
     print("Test d'intégration (backbone / encodeur / AFQS) réussi ✅")
-
-import torch
 
 def test_qfreedet_integration():
     """Test d'intégration complet pour QFreeDet (backbone, encodeur, AFQS, BLP et DP) sur GPU si disponible."""
