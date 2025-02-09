@@ -5,10 +5,10 @@ import copy
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import math
 
-from model import AFQS, ResNet50Backbone, PositionalEncoding2D, DeformableAttention, TransformerEncoder, MultiHeadAttention
+from model import AFQS, ResNet50Backbone, PositionalEncoding2D, DeformableAttention, TransformerEncoder, MultiHeadAttention, QFreeDet, BoxLocatingPart, DeduplicationPart
 from dataset import train_dataset, train_loader, train_ann_data, transform, train_dir, show_image_with_boxes
+from utils import compute_iou, PoCooLoss
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -644,6 +644,156 @@ def test_backbone_afqs_encoder():
 
     print("Test d'intégration (backbone / encodeur / AFQS) réussi ✅")
 
+import torch
+
+def test_qfreedet_integration():
+    """Test d'intégration complet pour QFreeDet (backbone, encodeur, AFQS, BLP et DP) sur GPU si disponible."""
+    torch.manual_seed(0)
+    batch_size = 2
+    img_size = 640  # images 640x640
+
+    backbone = ResNet50Backbone().to(device)
+    encoder = TransformerEncoder().to(device)
+    afqs = AFQS(threshold=0.5, max_pool_size=100, num_classes=80, feature_dim=256).to(device)
+    # Paramètres pour BLP et DP
+    embed_dim = 256
+    D = 256
+    H, W = 20, 20
+    T1 = 3  # nombre d'itérations pour BoxLocatingPart
+    T2 = 3  # nombre d'itérations pour DeduplicationPart
+    lambd = 1
+
+    blp = BoxLocatingPart(embed_dim=embed_dim, H=H, W=W, D=D, T1=T1).to(device)
+    dp = DeduplicationPart(embed_dim=embed_dim, H=H, W=W, D=D, T2=T2, lambd=lambd).to(device)
+
+    model = QFreeDet(backbone=backbone, afqs=afqs, encoder=encoder, blp=blp, dp=dp).to(device)
+    model.train()  # Test en mode entraînement
+
+    x = torch.randn(batch_size, 3, img_size, img_size).to(device)
+    B_blp, class_scores_blp, B_final, final_class_scores = model(x)
+
+    # On attend pour chaque image 100 boîtes et 100 sets de scores de classes
+    assert B_blp.shape == (batch_size, 100, 4), f"Shape de B_blp incorrecte: {B_blp.shape}"
+    assert class_scores_blp.shape == (batch_size, 100, 80), f"Shape de class_scores_blp incorrecte: {class_scores_blp.shape}"
+    assert B_final.shape == (batch_size, 100, 4), f"Shape de B_final incorrecte: {B_final.shape}"
+    assert final_class_scores.shape == (batch_size, 100, 80), f"Shape de final_class_scores incorrecte: {final_class_scores.shape}"
+    
+    print("Test d'intégration QFreeDet réussi ✅")
+
+def test_pocoo_loss():
+    """Test de la fonction de perte PoCooLoss."""
+    # ------------------------------------------------------------------
+    # 1. Initialisation de la loss
+    # ------------------------------------------------------------------
+    loss_fn = PoCooLoss(alpha=0.5, iou_threshold=0.5)
+    
+    # ------------------------------------------------------------------
+    # 2. Génération de données de test
+    # ------------------------------------------------------------------
+    B, M, J = 2, 100, 3  # Batch size, prédictions, ground truths
+    H, W = 640, 640  # Taille de l'image
+    
+    B_final = torch.rand(B, M, 4) * torch.tensor([W, H, W, H])  # Boîtes prédites
+    final_class_scores = torch.sigmoid(torch.randn(B, M, 80))  # Scores de classification
+    gt_boxes = torch.rand(B, J, 4) * torch.tensor([W, H, W, H])  # Boîtes ground truth
+    gt_labels = torch.randint(0, 2, (B, J, 80)).float()  # Labels ground truth
+    
+    # ------------------------------------------------------------------
+    # 3. Calcul de la perte
+    # ------------------------------------------------------------------
+    loss_value = loss_fn(B_final, final_class_scores, gt_boxes, gt_labels, (H, W))
+    
+    # ------------------------------------------------------------------
+    # 4. Vérifications de la sortie
+    # ------------------------------------------------------------------
+    assert isinstance(loss_value, torch.Tensor), f"La loss doit être un tenseur, obtenu: {type(loss_value)}"
+    assert loss_value.dim() == 0, f"La loss doit être scalaire, obtenu: {loss_value.shape}"
+    assert loss_value.item() >= 0, f"La loss doit être positive, obtenu: {loss_value.item()}"
+    
+    # ------------------------------------------------------------------
+    # 5. Vérifications des masques et pondérations
+    # ------------------------------------------------------------------
+    iou_matrix = compute_iou(B_final, gt_boxes)  # [B, M, J]
+    matched_iou, _ = iou_matrix.max(dim=-1)  # [B, M]
+    
+    pos_mask = (matched_iou > loss_fn.iou_threshold).float()
+    neg_mask = (pos_mask == 0).float()
+    
+    assert torch.all((pos_mask + neg_mask) == 1), "Les masques positif et négatif doivent être complémentaires."
+    
+    print("Test de la PoCoo Loss réussi ✅")
+
+def test_model_forward_and_loss():
+    """
+    Test complet avec calcul indépendant des losses pour BLP et DP.
+    Vérifie que chaque partie du modèle reçoit bien ses gradients.
+    """
+    torch.manual_seed(42)
+    batch_size = 1
+    img_size = 640  # Taille des images (640x640)
+
+    # Initialisation des composants du modèle sur le même device
+    backbone = ResNet50Backbone().to(device)
+    encoder = TransformerEncoder().to(device)
+    afqs = AFQS(threshold=0.5, max_pool_size=100, num_classes=80, feature_dim=256).to(device)
+    
+    # Paramètres pour BoxLocatingPart (BLP) et DeduplicationPart (DP)
+    embed_dim = 256
+    D = 256
+    H, W = 20, 20
+    T1 = 3  # Nombre d'itérations pour BLP
+    T2 = 3  # Nombre d'itérations pour DP
+    lambd = 1
+    
+    blp = BoxLocatingPart(embed_dim=embed_dim, H=H, W=W, D=D, T1=T1).to(device)
+    dp = DeduplicationPart(embed_dim=embed_dim, H=H, W=W, D=D, T2=T2, lambd=lambd).to(device)
+
+    # Création du modèle QFreeDet
+    model = QFreeDet(backbone=backbone, afqs=afqs, encoder=encoder, blp=blp, dp=dp).to(device)
+    model.train()
+
+    # Création d'un batch d'images synthétiques
+    x = torch.randn(batch_size, 3, img_size, img_size, device=device)
+
+    # Génération de ground truths synthétiques
+    num_gt = 5  # Nombre de ground truth par image
+    gt_boxes = torch.rand(batch_size, num_gt, 4, device=device) * img_size
+    num_classes = 80
+    gt_labels = torch.zeros(batch_size, num_gt, num_classes, device=device)
+    for i in range(batch_size):
+        for j in range(num_gt):
+            cls = torch.randint(0, num_classes, (1,), device=device).item()
+            gt_labels[i, j, cls] = 1.0
+
+    # Initialisation de la loss PoCooLoss
+    loss_fn = PoCooLoss(alpha=0.5, iou_threshold=0.5).to(device)
+
+    # === CALCUL DE LA LOSS POUR BLP ===
+    optimizer_blp = torch.optim.Adam(model.blp.parameters(), lr=1e-4)
+    B_blp, class_scores_blp = model(x, stage="blp")  # Exécute uniquement BLP
+    loss_blp = loss_fn(B_blp, class_scores_blp, gt_boxes, gt_labels, (img_size, img_size))
+
+    optimizer_blp.zero_grad()
+    loss_blp.backward()
+    optimizer_blp.step()
+
+    # === CALCUL DE LA LOSS POUR DP ===
+    optimizer_dp = torch.optim.Adam(model.dp.parameters(), lr=1e-4)
+    B_final, final_class_scores = model(x, stage="dp")  # Exécute uniquement DP
+    loss_dp = loss_fn(B_final, final_class_scores, gt_boxes, gt_labels, (img_size, img_size))
+
+    optimizer_dp.zero_grad()
+    loss_dp.backward()
+    optimizer_dp.step()
+
+    # === Vérification que chaque module reçoit bien ses gradients ===
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is None:
+            raise RuntimeError(f"Gradient manquant pour le paramètre : {name}")
+    
+    print(f"Test modèle forward et calcul de loss réussi ✅")
+    print(f"Loss BLP: {loss_blp.item():.4f} | Loss DP: {loss_dp.item():.4f}")
+
 if __name__ == "__main__":
     
     test_afqs()
@@ -654,5 +804,7 @@ if __name__ == "__main__":
     test_deformable_attention()
     test_transformer_encoder()
     test_backbone_afqs_encoder()
-    
+    test_qfreedet_integration()
+    test_pocoo_loss()
+    test_model_forward_and_loss() 
     test_visualization()

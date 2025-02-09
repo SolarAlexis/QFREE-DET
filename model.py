@@ -341,24 +341,223 @@ class TransformerEncoder(nn.Module):
         
         return x  # [B, 400, 256]
 
+class DeformableCrossAttention(nn.Module):
+    def __init__(self, d_model=256, nhead=8, num_points=4):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_points = num_points
+
+        self.offset_pred = nn.Linear(d_model, nhead * num_points * 2)
+        self.attn_pred = nn.Linear(d_model, nhead * num_points)
+        self.ref_point = nn.Linear(d_model, 2)
+        self.output_proj = nn.Linear(d_model, d_model)
+        
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.constant_(self.offset_pred.weight, 0)
+        nn.init.constant_(self.offset_pred.bias, 0)
+        nn.init.xavier_uniform_(self.attn_pred.weight)
+        nn.init.constant_(self.attn_pred.bias, 0)
+        nn.init.constant_(self.ref_point.weight, 0)
+        nn.init.constant_(self.ref_point.bias, 0)
+
+    def forward(self, SADQ, E, H, W):
+        B, M, D = SADQ.shape
+        offsets = self.offset_pred(SADQ).view(B, M, self.nhead, self.num_points, 2)
+        attn_weights = self.attn_pred(SADQ).view(B, M, self.nhead, self.num_points)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+
+        base_ref = self.ref_point(SADQ).unsqueeze(2).unsqueeze(3)
+        sampling_locations = base_ref.expand(-1, -1, self.nhead, self.num_points, 2) + offsets * 0.1
+        sampling_locations = sampling_locations.contiguous().view(B * M * self.nhead * self.num_points, 1, 1, 2)
+
+        E_spatial = E.view(B, H, W, D).permute(0, 3, 1, 2)
+        batch_idx = torch.arange(B, device=SADQ.device).unsqueeze(1).repeat(1, M * self.nhead * self.num_points).view(-1)
+        E_expanded = E_spatial[batch_idx]
+
+        sampled = F.grid_sample(E_expanded, sampling_locations, align_corners=False)
+        sampled = sampled.view(B, M, self.nhead, self.num_points, D)
+
+        sampled = sampled * attn_weights.unsqueeze(-1)
+        aggregated = sampled.sum(dim=3)
+        aggregated = aggregated.mean(dim=2)
+
+        return self.output_proj(aggregated)
+    
+class FFN(nn.Module):
+  def __init__(self, input, embed_dim, output):
+    super().__init__()
+    self.emb = embed_dim
+    self.input = input
+    self.output = output
+
+    self.layer = nn.Sequential(
+        nn.Linear(input, embed_dim), 
+        nn.ReLU(), 
+        nn.Linear(embed_dim, embed_dim),
+        nn.ReLU(), 
+        nn.Linear(embed_dim, output)
+    )
+
+  def forward(self, SADQ):
+    return self.layer(SADQ)
+
+class FFN_classes(nn.Module):
+  def __init__(self, input, embed_dim, output):
+    super().__init__()
+    self.emb = embed_dim
+    self.input = input
+    self.output = output
+
+    self.layer = nn.Sequential(
+        nn.Linear(input, embed_dim), 
+        nn.ReLU(), 
+        nn.Linear(embed_dim, embed_dim),
+        nn.ReLU(), 
+        nn.Linear(embed_dim, output),
+        nn.Sigmoid()
+    )
+
+  def forward(self, SADQ):
+    return self.layer(SADQ)
+
+class BoxLocatingPart(nn.Module):
+    def __init__(self, embed_dim, H, W, D, T1):
+        super(BoxLocatingPart, self).__init__()
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.cross_attention = DeformableCrossAttention(d_model=D, nhead=8, num_points=4)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        self.T1 = T1
+        self.H = H
+        self.W = W
+        self.ffn0 = FFN(input=D, embed_dim=embed_dim, output=4)
+        self.ffn_delta = FFN(input=D, embed_dim=embed_dim, output=4)
+        self.ffn_classes = FFN_classes(input=D, embed_dim=embed_dim, output=80)
+
+    def one_step(self, SADQ, E, H, W):
+        """
+        q_d : (B, M, D) -> Queries du décodeur
+        E   : (B, N, D) -> Features encodées
+        Returns:
+            q_d_final : (B, M, D) -> Features après Box Locating
+        """
+
+        q_d_attended = self.cross_attention(SADQ, E, H, W)
+
+        q_d_residual = self.layer_norm(SADQ + q_d_attended)
+        q_d_transformed = self.mlp(q_d_residual)
+        q_d_final = self.layer_norm(q_d_residual + q_d_transformed)
+
+        FFN_delta = self.ffn_delta(q_d_final)
+
+        return q_d_final, FFN_delta
+
+    def forward(self, SADQ, E, H, W):
+
+      B0 = self.ffn0(SADQ)
+      
+      for i in range(1,self.T1):
+        x = self.one_step(SADQ,E,H,W)
+        SADQ = x[0]
+        B0 =  B0 + x[1] 
+
+      return B0, self.ffn_classes(SADQ), SADQ
+
+
+class DeduplicationPart(nn.Module):
+    def __init__(self, embed_dim, H, W, D, T2, lambd):
+        super(DeduplicationPart, self).__init__()
+
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.cross_attention = DeformableCrossAttention(d_model=D, nhead=8, num_points=4)
+        self.multiheadattention = MultiHeadAttention(d_model=D, nhead=8)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        self.lambd = lambd
+        self.T2 = T2
+        self.H = H
+        self.W = W
+        self.ffn_delta = FFN(input=D, embed_dim=embed_dim, output=4)
+        self.ffn_classes = FFN_classes(input=D, embed_dim=embed_dim, output=80)
+
+    def one_step(self, USADQ, E, H, W):
+
+        q_d_attended = self.cross_attention(USADQ, E, H, W)
+        q_d_residual = self.layer_norm(USADQ + q_d_attended)
+
+        
+        for i in range(self.lambd):
+
+          q_d_transformed = self.multiheadattention(q_d_residual,q_d_residual,q_d_residual)
+          q_d_almost= self.layer_norm(q_d_residual + q_d_transformed[0])
+          q_q_final = self.mlp(q_d_almost)
+          q_q_residuals = q_q_final 
+        
+        FFN_delta = self.ffn_delta(q_q_final)
+
+        return q_q_residuals, FFN_delta
+
+    def forward(self, USADQ, E, H, W, up_boxes):
+      
+      B0 = up_boxes
+      for i in range(self.T2):
+        x = self.one_step(USADQ,E,H,W)
+        USADQ = x[0]
+        B0 =  B0 + x[1] 
+
+      return B0, self.ffn_classes(USADQ)
+
 class QFreeDet(nn.Module):
-    def __init__(self, backbone, afqs, encoder):
+    def __init__(self, backbone, afqs, encoder,blp,dp):
         super().__init__()
         self.backbone = backbone    # ResNet50Backbone
         self.encoder = encoder      # Transformer Encoder
         self.afqs = afqs            # AFQS module
+        self.blp = blp
+        self.dp = dp
 
-    def forward(self, x):
+    def forward(self, x, stage="full"):
+        """
+        Mode de fonctionnement:
+        - "blp" : Exécute uniquement BLP et retourne ses sorties.
+        - "dp"  : Exécute DP avec les sorties détachées de BLP.
+        - "full" : Exécute tout le pipeline (BLP -> DP).
+        """
         # 1. Extract multi-scale features
         features = self.backbone(x)
         
         # 2. Use last feature map (c5) for encoding
         c5 = features[-1]  # [B, 2048, H, W]
-        
+
         # 3. Transform to encoder tokens
         encoder_tokens = self.encoder(c5)  # [B, N, D]
-        
+
         # 4. Query selection
-        SADQ, selection_mask = self.afqs(encoder_tokens)
-        
-        return SADQ, selection_mask
+        SADQ, selection_mask = self.afqs(encoder_tokens)  # [B, M, D]
+
+        # 5. Localisation des boîtes avec BLP
+        B_blp, class_scores_blp, refined_queries = self.blp(SADQ, encoder_tokens, H=20, W=20)
+
+        if stage == "blp":
+            return B_blp, class_scores_blp  # Permet de calculer la loss BLP uniquement
+
+        # === Détachement avant DP ===
+        refined_queries = refined_queries.detach()
+        B_blp = B_blp.detach()
+
+        # 6. Déduplication avec DP
+        B_final, final_class_scores = self.dp(refined_queries, encoder_tokens, H=20, W=20, up_boxes=B_blp)
+
+        if stage == "dp":
+            return B_final, final_class_scores  # Permet de calculer la loss DP uniquement
+
+        return B_blp, class_scores_blp, B_final, final_class_scores  # Mode full (entraînement standard)
