@@ -143,8 +143,8 @@ train_dataset = FastCocoDataset(train_dir, train_ann_data, transform=transform)
 val_dataset = FastCocoDataset(val_dir, val_ann_data, transform=transform)
 
 # Création des DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
-val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=0, collate_fn=custom_collate_fn)
+train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
+val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=custom_collate_fn)
 
 # Chargement des catégories pour l'affichage
 with open(train_ann_file, 'r') as f:

@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 from model import AFQS, ResNet50Backbone, PositionalEncoding2D, DeformableAttention, TransformerEncoder, MultiHeadAttention, QFreeDet, BoxLocatingPart, DeduplicationPart
 from dataset import train_dataset, train_loader, train_ann_data, transform, train_dir, show_image_with_boxes
-from utils import compute_iou, PoCooLoss
+from utils import compute_iou, PoCooLoss, qfreedet_loss, compute_branch_loss
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -211,8 +211,8 @@ def test_dataset_and_backbone():
     images, targets = batch
     
     # Vérifier le format du batch
-    assert images.shape == (8, 3, 640, 640), f"Shape batch incorrect: {images.shape}"
-    assert len(targets) == 8, f"Nombre d'annotations incorrect: {len(targets)}"
+    assert images.shape == (1, 3, 640, 640), f"Shape batch incorrect: {images.shape}"
+    assert len(targets) == 1, f"Nombre d'annotations incorrect: {len(targets)}"
     
     # Vérifier le type des annotations
     assert isinstance(targets, list), "Les annotations doivent être une liste"
@@ -230,10 +230,10 @@ def test_dataset_and_backbone():
         features = backbone(images)
     
     # Vérifier les dimensions des features maps
-    assert features[0].shape == (8, 256, 160, 160), f"C2 shape incorrect: {features[0].shape}"
-    assert features[1].shape == (8, 512, 80, 80), f"C3 shape incorrect: {features[1].shape}"
-    assert features[2].shape == (8, 1024, 40, 40), f"C4 shape incorrect: {features[2].shape}"
-    assert features[3].shape == (8, 2048, 20, 20), f"C5 shape incorrect: {features[3].shape}"
+    assert features[0].shape == (1, 256, 160, 160), f"C2 shape incorrect: {features[0].shape}"
+    assert features[1].shape == (1, 512, 80, 80), f"C3 shape incorrect: {features[1].shape}"
+    assert features[2].shape == (1, 1024, 40, 40), f"C4 shape incorrect: {features[2].shape}"
+    assert features[3].shape == (1, 2048, 20, 20), f"C5 shape incorrect: {features[3].shape}"
     
     print("Test 3 (Backbone outputs) réussi ✅")
 
@@ -702,9 +702,17 @@ def test_pocoo_loss():
 
 def test_model_forward_and_loss():
     """
-    Test complet avec calcul indépendant des losses pour BLP et DP.
-    Vérifie que chaque partie du modèle reçoit bien ses gradients.
+    Test complet pour le modèle QFreeDet en utilisant les sorties des branches BLP et DP
+    de manière séparée pour calculer la loss globale. Ainsi, la branche BLP n'est pas détachée,
+    et tous les modules reçoivent bien leurs gradients.
     """
+    import torch
+    import torch.nn as nn
+    # On suppose que les modules suivants sont définis et importés :
+    # ResNet50Backbone, TransformerEncoder, AFQS, BoxLocatingPart, DeduplicationPart,
+    # QFreeDet, compute_branch_loss, PoCooLoss
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
     batch_size = 1
     img_size = 640  # Taille des images (640x640)
@@ -742,34 +750,152 @@ def test_model_forward_and_loss():
             cls = torch.randint(0, num_classes, (1,), device=device).item()
             gt_labels[i, j, cls] = 1.0
 
-    # Initialisation de la loss PoCooLoss
-    loss_fn = PoCooLoss(alpha=0.5, iou_threshold=0.5).to(device)
+    # --- Calcul des sorties pour chaque branche ---
+    # Pour la branche BLP (les gradients seront propagés jusqu'ici)
+    B_blp, class_scores_blp = model(x, stage="blp")
+    # Pour la branche DP (cette branche détache les sorties de BLP, ce qui est voulu ici)
+    B_final, final_class_scores = model(x, stage="dp")
+    
+    # --- Calcul des losses pour chaque branche ---
+    # Coefficients donnés par l'ablation :
+    BCE_BLP  = 0.2
+    L1_BLP   = 5.0
+    GIoU_BLP = 2.0
+    BCE_DP   = 2.0
+    L1_DP    = 2.0
+    GIoU_DP  = 2.0
 
-    # === CALCUL DE LA LOSS POUR BLP ===
-    optimizer_blp = torch.optim.Adam(model.blp.parameters(), lr=1e-4)
-    B_blp, class_scores_blp = model(x, stage="blp")  # Exécute uniquement BLP
-    loss_blp = loss_fn(B_blp, class_scores_blp, gt_boxes, gt_labels, (img_size, img_size))
+    loss_blp = compute_branch_loss(B_blp, class_scores_blp, gt_boxes, gt_labels, 
+                                   (img_size, img_size), BCE_BLP, L1_BLP, GIoU_BLP)
+    loss_dp  = compute_branch_loss(B_final, final_class_scores, gt_boxes, gt_labels, 
+                                   (img_size, img_size), BCE_DP, L1_DP, GIoU_DP)
+    # PoCoo loss appliquée sur la branche DP
+    pocoo_loss_module = PoCooLoss(alpha=0.5, iou_threshold=0.5).to(device)
+    loss_pocoo = pocoo_loss_module(B_final, final_class_scores, gt_boxes, gt_labels, 
+                                   (img_size, img_size))
+    
+    total_loss = loss_blp + loss_dp + loss_pocoo
 
-    optimizer_blp.zero_grad()
-    loss_blp.backward()
-    optimizer_blp.step()
+    # Optimiseur pour l'ensemble des paramètres du modèle
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
 
-    # === CALCUL DE LA LOSS POUR DP ===
-    optimizer_dp = torch.optim.Adam(model.dp.parameters(), lr=1e-4)
-    B_final, final_class_scores = model(x, stage="dp")  # Exécute uniquement DP
-    loss_dp = loss_fn(B_final, final_class_scores, gt_boxes, gt_labels, (img_size, img_size))
-
-    optimizer_dp.zero_grad()
-    loss_dp.backward()
-    optimizer_dp.step()
-
-    # === Vérification que chaque module reçoit bien ses gradients ===
+    # Vérification que chaque paramètre requérant des gradients en reçoit bien
     for name, param in model.named_parameters():
         if param.requires_grad and param.grad is None:
             raise RuntimeError(f"Gradient manquant pour le paramètre : {name}")
     
-    print(f"Test modèle forward et calcul de loss réussi ✅")
-    print(f"Loss BLP: {loss_blp.item():.4f} | Loss DP: {loss_dp.item():.4f}")
+    print("Test modèle forward et calcul de loss réussi ✅")
+    print(f"Loss globale: {total_loss.item():.4f}")
+
+def test_model_forward_and_loss2():
+    """
+    Test complet pour le modèle QFreeDet utilisant le premier batch du DataLoader.
+    On récupère le premier élément (image et annotations) du DataLoader, on prépare les
+    ground truths dans le format attendu (après conversion des category_id en indices contigus),
+    et on calcule la loss globale en combinant les losses de la branche BLP et DP (avec la PoCoo loss).
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(42)
+    
+    # Récupération du premier batch du DataLoader
+    batch = next(iter(train_loader))
+    images, targets = batch
+    # Utiliser le premier élément du batch (comme en training)
+    x = images[0:1].to(device)  # x de forme [1, 3, 640, 640]
+    
+    # Préparation des ground truths à partir des annotations du premier élément
+    sample_targets = targets[0]  # Liste d'annotations pour la première image
+    num_classes = 80
+    num_gt = len(sample_targets)
+    if num_gt == 0:
+        raise RuntimeError("Le premier élément du DataLoader ne contient aucune annotation.")
+    
+    # Construire gt_boxes de forme [1, num_gt, 4]
+    gt_boxes = torch.zeros((1, num_gt, 4), device=device)
+    
+    # IMPORTANT : Construire un mapping des category_id (non contigus) en indices contigus [0, num_classes-1]
+    categories = train_ann_data['categories']
+    cat_ids = sorted([cat['id'] for cat in categories])
+    cat_id_to_index = {cat_id: idx for idx, cat_id in enumerate(cat_ids)}
+    
+    # Construire gt_labels de forme [1, num_gt, num_classes]
+    gt_labels = torch.zeros((1, num_gt, num_classes), device=device)
+    for j, ann in enumerate(sample_targets):
+        # On suppose que ann["bbox"] est au format [x, y, w, h]
+        box = torch.tensor(ann["bbox"], device=device, dtype=torch.float32)
+        gt_boxes[0, j] = box
+        # Conversion de l'id de catégorie en indice contigu
+        try:
+            cat = cat_id_to_index[ann["category_id"]]
+        except KeyError:
+            raise KeyError(f"Category id {ann['category_id']} non trouvé dans le mapping.")
+        gt_labels[0, j, cat] = 1.0
+
+    # Taille de l'image attendue (640x640)
+    img_size = 640
+
+    # --- Initialisation des composants du modèle ---
+    backbone = ResNet50Backbone().to(device)
+    encoder = TransformerEncoder().to(device)
+    afqs = AFQS(threshold=0.5, max_pool_size=100, num_classes=num_classes, feature_dim=256).to(device)
+    
+    # Paramètres pour BoxLocatingPart (BLP) et DeduplicationPart (DP)
+    embed_dim = 256
+    D = 256
+    H, W = 20, 20
+    T1 = 3  # Nombre d'itérations pour BLP
+    T2 = 3  # Nombre d'itérations pour DP
+    lambd = 1
+    
+    blp = BoxLocatingPart(embed_dim=embed_dim, H=H, W=W, D=D, T1=T1).to(device)
+    dp = DeduplicationPart(embed_dim=embed_dim, H=H, W=W, D=D, T2=T2, lambd=lambd).to(device)
+
+    # Création du modèle QFreeDet
+    model = QFreeDet(backbone=backbone, afqs=afqs, encoder=encoder, blp=blp, dp=dp).to(device)
+    model.train()
+
+    # --- Forward pass pour chaque branche ---
+    # Mode "blp": la branche BLP (les gradients seront propagés depuis ici)
+    B_blp, class_scores_blp = model(x, stage="blp")
+    # Mode "dp": la branche DP (cette branche détache les sorties de BLP, ce qui est voulu)
+    B_final, final_class_scores = model(x, stage="dp")
+    
+    # --- Calcul des losses pour chaque branche ---
+    # Coefficients d'ablation (donnés)
+    BCE_BLP  = 0.2
+    L1_BLP   = 5.0
+    GIoU_BLP = 2.0
+    BCE_DP   = 2.0
+    L1_DP    = 2.0
+    GIoU_DP  = 2.0
+
+    loss_blp = compute_branch_loss(B_blp, class_scores_blp, gt_boxes, gt_labels,
+                                   (img_size, img_size), BCE_BLP, L1_BLP, GIoU_BLP)
+    loss_dp  = compute_branch_loss(B_final, final_class_scores, gt_boxes, gt_labels,
+                                   (img_size, img_size), BCE_DP, L1_DP, GIoU_DP)
+    # PoCoo loss appliquée sur la branche DP
+    pocoo_loss_module = PoCooLoss(alpha=0.5, iou_threshold=0.5).to(device)
+    loss_pocoo = pocoo_loss_module(B_final, final_class_scores, gt_boxes, gt_labels,
+                                   (img_size, img_size))
+    
+    total_loss = loss_blp + loss_dp + loss_pocoo
+
+    # --- Optimisation ---
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    # Vérification que tous les paramètres recevant des gradients en ont bien
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is None:
+            raise RuntimeError(f"Gradient manquant pour le paramètre : {name}")
+    
+    print("Test modèle forward et calcul de loss réussi ✅")
+    print(f"Loss globale: {total_loss.item():.4f}")
 
 if __name__ == "__main__":
     
@@ -783,5 +909,6 @@ if __name__ == "__main__":
     test_backbone_afqs_encoder()
     test_qfreedet_integration()
     test_pocoo_loss()
-    test_model_forward_and_loss() 
+    test_model_forward_and_loss()
+    test_model_forward_and_loss2()
     test_visualization()
