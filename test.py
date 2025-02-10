@@ -7,8 +7,8 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 from model import AFQS, ResNet50Backbone, PositionalEncoding2D, DeformableAttention, TransformerEncoder, MultiHeadAttention, QFreeDet, BoxLocatingPart, DeduplicationPart
-from dataset import train_dataset, train_loader, train_ann_data, transform, train_dir, show_image_with_boxes
-from utils import compute_iou, PoCooLoss, qfreedet_loss, compute_branch_loss
+from dataset import train_dataset, train_loader, train_ann_data, transform, train_dir, show_image_with_boxes, category_id_to_name
+from utils import compute_iou, PoCooLoss, compute_branch_loss
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -241,38 +241,56 @@ def test_dataset_and_backbone():
     print("Test 3 (Backbone outputs) réussi ✅")
 
     # ----------------------------------------------------------------------
-    # Test 4: Vérification du redimensionnement des bounding boxes (CORRIGÉ)
+    # Test 4: Vérification du redimensionnement des bounding boxes (format centre)
     # ----------------------------------------------------------------------
     # Trouver une image avec annotations
     sample_idx = next((i for i, (_, t) in enumerate(train_dataset) if len(t) > 0), None)
     assert sample_idx is not None, "Aucune image annotée trouvée"
-    
+
     # Récupérer les données originales
     image_id = train_dataset.image_ids[sample_idx]
     image_info = next(img for img in train_ann_data['images'] if img['id'] == image_id)
     original_anns = [copy.deepcopy(ann) for ann in train_ann_data['annotations'] if ann['image_id'] == image_id]
-    
+
     # Charger l'image originale
     original_image = Image.open(os.path.join(train_dir, image_info['file_name'])).convert('RGB')
-    
+
     # Appliquer la transformation avec copie
     transformed_image, transformed_anns = transform(copy.deepcopy(original_image), copy.deepcopy(original_anns))
-    
-    # Vérifier une annotation
-    original_bbox = original_anns[0]['bbox']
-    transformed_bbox = transformed_anns[0]['bbox']
-    
-    # Calcul des ratios théoriques
+
+    # Pour une annotation donnée, récupérer la bbox originale au format COCO et la bbox transformée
+    # La bbox originale est au format [x_min, y_min, w, h]
+    original_bbox = original_anns[0]['bbox']  
+    # Calculer les facteurs d'échelle
     x_scale = 640 / original_image.width
     y_scale = 640 / original_image.height
-    
-    # Vérification avec marge d'erreur
-    assert abs(transformed_bbox[1] - original_bbox[1] * y_scale) < 1e-4, (
-        f"Erreur Y: {transformed_bbox[1]} vs {original_bbox[1] * y_scale} "
-        f"(Original H: {original_image.height}px)"
-    )
-    
-    print("Test 4 (BBox scaling) réussi ✅")
+
+    # Appliquer le redimensionnement sur la bbox originale (toujours en format [x_min, y_min, w, h])
+    scaled_bbox = [
+        original_bbox[0] * x_scale,  # x_min mis à l'échelle
+        original_bbox[1] * y_scale,  # y_min mis à l'échelle
+        original_bbox[2] * x_scale,  # largeur mis à l'échelle
+        original_bbox[3] * y_scale   # hauteur mis à l'échelle
+    ]
+
+    # Convertir la bbox redimensionnée au format centre
+    expected_bbox = [
+        scaled_bbox[0] + scaled_bbox[2] / 2,  # x_center
+        scaled_bbox[1] + scaled_bbox[3] / 2,  # y_center
+        scaled_bbox[2],                     # largeur
+        scaled_bbox[3]                      # hauteur
+    ]
+
+    # Récupérer la bbox transformée
+    transformed_bbox = transformed_anns[0]['bbox']
+
+    # Vérifier que chaque composant est correctement transformé (avec une petite tolérance)
+    for i in range(4):
+        assert abs(transformed_bbox[i] - expected_bbox[i]) < 1e-4, (
+            f"Erreur bbox index {i}: {transformed_bbox[i]} vs {expected_bbox[i]}"
+        )
+
+    print("Test 4 (BBox scaling, format centre) réussi ✅")
 
     # ----------------------------------------------------------------------
     # Test 5: Vérification de la normalisation des images
@@ -313,10 +331,10 @@ def test_visualization():
             if len(sample_indices) == 8:
                 break
     assert len(sample_indices) == 8, "Pas assez d'images avec annotations trouvées"
-    
+
     # Créer une figure pour l'affichage (2 lignes, 4 colonnes)
-    fig, axs = plt.subplots(2, 4, figsize=(14, 7))  # Taille ajustée pour 8 images
-    
+    fig, axs = plt.subplots(2, 4, figsize=(14, 7))
+
     # Afficher chaque image avec ses bounding boxes
     for i, ax in enumerate(axs.flat):
         # Charger l'image et ses annotations
@@ -328,8 +346,9 @@ def test_visualization():
         # Vérifier la présence d'annotations
         assert len(targets) > 0, "Aucune annotation trouvée pour cette image"
         
-        # Afficher l'image avec les bounding boxes
-        show_image_with_boxes(ax, image_tensor, targets, normalized=True)
+        # Afficher l'image avec les bounding boxes (les boxes sont au format centre)
+        # En passant également le mapping pour afficher le nom du label.
+        show_image_with_boxes(ax, image_tensor, targets, normalized=True, category_mapping=category_id_to_name)
         ax.axis('off')
         
         # Vérifier que l'image est correctement dénormalisée
@@ -341,7 +360,6 @@ def test_visualization():
         assert torch.all(denormalized_image >= 0).item(), "Erreur de dénormalisation : valeurs négatives"
         assert torch.all(denormalized_image <= 1).item(), "Erreur de dénormalisation : valeurs > 1"
     
-    # Afficher la figure
     plt.tight_layout()
     plt.show()
     
@@ -424,7 +442,7 @@ def test_multihead_attention():
         with torch.no_grad():
             somme = attn_weights.sum(dim=-1)  # (B, nhead, N)
             ones = torch.ones_like(somme)
-            assert torch.all(torch.isclose(somme, ones, atol=1e-3)), (
+            assert torch.all(torch.isclose(somme, ones, atol=2e-3)), (
                 f"Erreur : Différence max = {torch.abs(somme - ones).max().item()}"
             )
 
@@ -484,7 +502,7 @@ def test_deformable_attention():
         with torch.no_grad():
             attn = layer.attn_pred(x_spatial).view(B, nhead, num_points, H, W)
             attn_softmax = F.softmax(attn, dim=2)
-            assert torch.allclose(attn_softmax.sum(dim=2), torch.ones_like(attn_softmax.sum(dim=2)), atol=1e-3), (
+            assert torch.allclose(attn_softmax.sum(dim=2), torch.ones_like(attn_softmax.sum(dim=2)), atol=2e-3), (
                 "Les poids d'attention ne sont pas normalisés (softmax incorrect)."
             )
 

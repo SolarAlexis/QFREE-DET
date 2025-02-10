@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 # Importez vos définitions du dataset
-from dataset import train_loader, val_loader, train_ann_data  # (train_ann_data contient les annotations COCO)
+from dataset import train_loader, val_loader
  
 # Importez vos modules de modèle (adaptez les chemins si besoin)
 from model import ResNet50Backbone, TransformerEncoder, AFQS, BoxLocatingPart, DeduplicationPart, QFreeDet

@@ -150,6 +150,27 @@ class PoCooLoss(nn.Module):
         loss = loss_pos.sum() + loss_neg.sum()
         return loss / B  # normalisation par le batch
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.bce = nn.BCELoss(reduction="none")
+    
+    def forward(self, inputs, targets):
+        # inputs et targets ont la même forme : [B, M, num_classes]
+        bce_loss = self.bce(inputs, targets)
+        pt = torch.where(targets == 1, inputs, 1 - inputs)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 # --- Perte sur une branche donnée (BLP ou DP) ---
 
 def compute_branch_loss(pred_boxes, pred_scores, gt_boxes, gt_labels, img_size,
@@ -187,11 +208,11 @@ def compute_branch_loss(pred_boxes, pred_scores, gt_boxes, gt_labels, img_size,
     # On définit le masque positif sur la base d’un seuil IoU de 0.5
     pos_mask = (matched_iou > 0.5).float()  # [B, M]
 
-    # -- Perte de classification BCE --
-    bce_loss_fn = nn.BCELoss(reduction='none')
+    # -- Perte focale --
+    focal_loss = FocalLoss()
     # Pour les positifs, la cible est matched_gt_labels ; pour les négatifs, zéro.
-    loss_cls_pos = bce_loss_fn(pred_scores, matched_gt_labels) * pos_mask.unsqueeze(-1)
-    loss_cls_neg = bce_loss_fn(pred_scores, torch.zeros_like(pred_scores)) * (1 - pos_mask).unsqueeze(-1)
+    loss_cls_pos = focal_loss(pred_scores, matched_gt_labels) * pos_mask.unsqueeze(-1)
+    loss_cls_neg = focal_loss(pred_scores, torch.zeros_like(pred_scores)) * (1 - pos_mask).unsqueeze(-1)
     loss_cls = (loss_cls_pos.sum() + loss_cls_neg.sum()) / B
 
     # -- Perte de régression L1 (uniquement sur les positifs) --

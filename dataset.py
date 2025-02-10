@@ -2,9 +2,7 @@ import torchvision
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data._utils.collate import default_collate
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 from PIL import Image
-import numpy as np
 import json
 import os
 import torch
@@ -172,36 +170,39 @@ categories = coco_data['categories']
 category_id_to_name = {category['id']: category['name'] for category in categories}
 
 # Fonction d'affichage avec les nouvelles coordonnées
-def show_image_with_boxes(ax, image_tensor, targets, normalized=True):
-    
-    # Dénormalisation si nécessaire
+def show_image_with_boxes(ax, image_tensor, targets, normalized=True, category_mapping=None):
+    """
+    Affiche une image avec ses bounding boxes.
+    Les bounding boxes sont supposées être au format centré (cx, cy, w, h).
+
+    Args:
+        ax (matplotlib.axes.Axes): Axe sur lequel dessiner.
+        image_tensor (Tensor): Image au format [3, H, W].
+        targets (list): Liste d'annotations contenant au moins les clés 'bbox' et 'category_id'.
+        normalized (bool): Si True, l'image est dénormalisée avant affichage.
+        category_mapping (dict, optionnel): Mapping de category_id vers nom (exemple : category_id_to_name).
+    """
+    # Si l'image est normalisée, la dénormaliser
     if normalized:
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        image = image_tensor * std + mean  # Dénormalisation
-    else:
-        image = image_tensor
-    
-    # Conversion du tensor en image PIL
-    image = image.permute(1, 2, 0).numpy()  # Utiliser la variable `image` dénormalisée
-    image = np.clip(image, 0, 1)  # S'assurer que les valeurs sont dans [0, 1]
-    image = (image * 255).astype(np.uint8)
-    ax.imshow(image)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+        image_tensor = image_tensor * std + mean
 
-    # Dessin des boîtes redimensionnées
+    # Convertir en numpy pour l'affichage (H, W, C)
+    image_np = image_tensor.permute(1, 2, 0).cpu().numpy()
+    ax.imshow(image_np)
+
+    # Parcourir les annotations et dessiner les bounding boxes
     for target in targets:
-        bbox = target['bbox']
-        category_id = target['category_id']
-        class_name = category_id_to_name.get(category_id, f"Unknown ({category_id})")
-
-        # Création du rectangle
-        rect = patches.Rectangle(
-            (bbox[0], bbox[1]),
-            bbox[2],
-            bbox[3],
-            linewidth=1,
-            edgecolor='r',
-            facecolor='none'
-        )
+        bbox = target['bbox']  # format : [cx, cy, w, h]
+        cx, cy, w, h = bbox
+        # Conversion en format coin supérieur gauche
+        x_min = cx - w / 2
+        y_min = cy - h / 2
+        # Création d'un rectangle rouge
+        rect = plt.Rectangle((x_min, y_min), w, h, fill=False, edgecolor='red', linewidth=2)
         ax.add_patch(rect)
-        ax.text(bbox[0], bbox[1], class_name, color='white', backgroundcolor='red', fontsize=8)
+        # Ajout du label si le mapping est fourni
+        if category_mapping is not None and 'category_id' in target:
+            label = category_mapping.get(target['category_id'], str(target['category_id']))
+            ax.text(x_min, y_min, label, color='white', fontsize=10, backgroundcolor='red')

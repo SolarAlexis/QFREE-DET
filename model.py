@@ -4,15 +4,13 @@ import torchvision
 import torch.nn.functional as F
 import math
 
-from config import params
-
 class AFQS(nn.Module):
     def __init__(self, 
-                 threshold=params["AFQS_threshold"], 
-                 max_pool_size=params["AFQS_max_pool_size"], 
+                 threshold=0.5, 
+                 max_pool_size=100, 
                  num_classes=80, 
                  feature_dim=256,
-                 tau=params["AFQS_temperature"]):  # température pour la relaxation
+                 tau=0.1):  # température pour la relaxation
         super().__init__()
         self.S = threshold
         self.tau = tau
@@ -57,7 +55,7 @@ class AFQS(nn.Module):
                 valid_indices = torch.where(hard_mask[b] > 0)[0]
                 num_valid = len(valid_indices)
                 
-                # Sélection des tokens valides (utilise le hard_mask pour la sélection effective)
+                # Sélection des tokens valides
                 selected = encoder_tokens[b, valid_indices] if num_valid > 0 else torch.zeros((0, D), device=encoder_tokens.device)
                 
                 padding_needed = N_query_b - num_valid
@@ -71,7 +69,6 @@ class AFQS(nn.Module):
                     else:
                         padding_tokens = torch.zeros((0, D), device=encoder_tokens.device)
                     
-                    # Si besoin, compléter avec des zéros
                     remaining_padding = padding_needed - len(padding_tokens)
                     if remaining_padding > 0:
                         zero_pad = torch.zeros((remaining_padding, D), device=encoder_tokens.device)
@@ -79,7 +76,7 @@ class AFQS(nn.Module):
                     
                     aligned = torch.cat([selected, padding_tokens], dim=0)
                 else:
-                    aligned = selected[:N_query_b]  # en cas de surplus (rare)
+                    aligned = selected[:N_query_b]  # en cas de surplus 
                 
                 aligned_queries.append(aligned)
             
