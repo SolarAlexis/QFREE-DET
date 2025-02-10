@@ -90,8 +90,20 @@ class AFQS(nn.Module):
             SADQ = torch.stack(aligned_queries, dim=0) + dummy  # [B, N_query_b, D]
         
         else:
-            # En mode inférence, on retourne les requêtes avec une sélection dure
-            SADQ = [encoder_tokens[b, torch.where(hard_mask[b] > 0)[0]] for b in range(B)]
+            # En mode inférence, on sélectionne les requêtes avec un masque dur.
+            # On collecte d'abord les requêtes pour chaque image dans une liste
+            aligned_queries = [encoder_tokens[b, torch.where(hard_mask[b] > 0)[0]] for b in range(B)]
+            # Afin d'assurer une sortie de type Tensor, nous allons les empiler.
+            # Pour cela, nous déterminons le nombre maximum de requêtes parmi les images et
+            # complétons les autres avec des zéros.
+            max_queries = max(q.shape[0] for q in aligned_queries) if aligned_queries else 0
+            padded_queries = []
+            for q in aligned_queries:
+                if q.shape[0] < max_queries:
+                    pad = torch.zeros((max_queries - q.shape[0], D), device=encoder_tokens.device)
+                    q = torch.cat([q, pad], dim=0)
+                padded_queries.append(q)
+            SADQ = torch.stack(padded_queries, dim=0)  # [B, max_queries, D]
         
         return SADQ, selection_mask
     

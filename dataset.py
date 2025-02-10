@@ -1,5 +1,5 @@
 import torchvision
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data._utils.collate import default_collate
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -142,9 +142,25 @@ val_ann_data = load_coco_annotations(val_ann_file)
 train_dataset = FastCocoDataset(train_dir, train_ann_data, transform=transform)
 val_dataset = FastCocoDataset(val_dir, val_ann_data, transform=transform)
 
-# Création des DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
-val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=custom_collate_fn)
+# # Création des DataLoaders
+# train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
+# val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=custom_collate_fn)
+
+# Nombre d'images à utiliser pour l'entraînement et la validation
+num_train_samples = 100  # Changez selon vos besoins
+num_val_samples = 20
+
+# Sélectionner les indices d'échantillons (aléatoires ou premiers N)
+train_indices = torch.randperm(len(train_dataset))[:num_train_samples].tolist()
+val_indices = torch.randperm(len(val_dataset))[:num_val_samples].tolist()
+
+# Création des sous-ensembles
+train_subset = Subset(train_dataset, train_indices)
+val_subset = Subset(val_dataset, val_indices)
+
+# Création des DataLoaders avec les sous-ensembles
+train_loader = DataLoader(train_subset, batch_size=1, shuffle=True, num_workers=0, collate_fn=custom_collate_fn)
+val_loader = DataLoader(val_subset, batch_size=1, shuffle=False, num_workers=0, collate_fn=custom_collate_fn)
 
 # Chargement des catégories pour l'affichage
 with open(train_ann_file, 'r') as f:

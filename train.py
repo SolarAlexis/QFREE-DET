@@ -95,6 +95,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs):
     
     train_losses = []
     val_losses = []
+    first_epoch_losses = []
     
     for epoch in range(num_epochs):
         model.train()
@@ -119,6 +120,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs):
             
             running_loss += loss.item()
             train_bar.set_postfix(loss=f"{loss.item():.4f}")
+            if epoch == 0:
+                first_epoch_losses.append(loss.item())
             
         avg_train_loss = running_loss / len(train_loader)
         train_losses.append(avg_train_loss)
@@ -140,7 +143,19 @@ def train_model(model, train_loader, val_loader, device, num_epochs):
         val_losses.append(avg_val_loss)
         
         print(f"Epoch [{epoch+1}/{num_epochs}] -> Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-    
+
+        if epoch == 0:
+            plt.figure(figsize=(8, 5))
+            plt.plot(first_epoch_losses, label="Train Loss (1ère époque)")
+            plt.xlabel("Itération")
+            plt.ylabel("Loss")
+            plt.title("Courbe de la loss sur la première époque")
+            plt.legend()
+            plt.grid(True)
+            plt.savefig("first_epoch_loss.png")
+            plt.show()
+            print("Courbe de la loss de la première époque sauvegardée sous 'first_epoch_loss.png'.")
+        
     # Tracé et sauvegarde des courbes de loss
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, num_epochs+1), train_losses, label="Train Loss")
@@ -180,5 +195,5 @@ if __name__ == "__main__":
     model = QFreeDet(backbone=backbone, afqs=afqs, encoder=encoder, blp=blp, dp=dp).to(device)
     
     # Nombre d'époques d'entraînement
-    num_epochs = 10
+    num_epochs = 2
     train_model(model, train_loader, val_loader, device, num_epochs)
