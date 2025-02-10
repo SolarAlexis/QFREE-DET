@@ -17,17 +17,17 @@ from utils import qfreedet_loss
 # -----------------------------------------------------------------------------
 def prepare_ground_truths(targets, num_classes, device, cat_id_to_index):
     """
-    Convertit une liste (taille B) de listes d'annotations en tenseurs
-    uniformisés par padding.
+    Convertit une liste (taille B) de listes d'annotations en tenseurs uniformisés par padding.
     
     Args:
-        targets (list): Liste (taille B) de listes d'annotations (chaque annotation est un dict contenant au moins "bbox" et "category_id").
+        targets (list): Liste (taille B) de listes d'annotations. Chaque annotation est un dict contenant au moins
+                        "bbox" (au format (x_center, y_center, w, h)) et "category_id".
         num_classes (int): Par exemple, 80.
         device (torch.device): Le device d'exécution.
         cat_id_to_index (dict): Mapping des category_id (du COCO) vers des indices contigus (0 à num_classes-1).
         
     Returns:
-        gt_boxes (Tensor): de forme [B, max_objects, 4].
+        gt_boxes (Tensor): de forme [B, max_objects, 4] (format (x_center, y_center, w, h)).
         gt_labels (Tensor): de forme [B, max_objects, num_classes] en one-hot.
     """
     batch_size = len(targets)

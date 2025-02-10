@@ -40,21 +40,25 @@ class ResizeWithAnnotations:
         new_width, new_height = self.size
         
         for t in target:
-            # Copier le dictionnaire d'annotation
             new_t = t.copy()
-            bbox = new_t['bbox'].copy()
+            bbox = new_t['bbox'].copy()  # COCO: [x_min, y_min, w, h]
             
-            # Calcul des ratios
+            # Calcul des ratios de mise à l'échelle
             x_scale = new_width / original_width
             y_scale = new_height / original_height
             
-            # Mise à l'échelle
-            bbox[0] *= x_scale
-            bbox[1] *= y_scale
-            bbox[2] *= x_scale
-            bbox[3] *= y_scale
+            # Mise à l'échelle de la boîte
+            bbox[0] *= x_scale  # x_min
+            bbox[1] *= y_scale  # y_min
+            bbox[2] *= x_scale  # width
+            bbox[3] *= y_scale  # height
             
-            new_t['bbox'] = bbox
+            # Conversion du format COCO (x_min, y_min, w, h) vers (x_center, y_center, w, h)
+            cx = bbox[0] + bbox[2] / 2
+            cy = bbox[1] + bbox[3] / 2
+            new_bbox = [cx, cy, bbox[2], bbox[3]]
+            
+            new_t['bbox'] = new_bbox
             processed_target.append(new_t)
 
         # Redimensionnement de l'image
@@ -66,7 +70,6 @@ class ResizeWithAnnotations:
             image = self.normalize(image)
         
         return image, processed_target
-
 # Dataset personnalisé avec gestion intégrée du redimensionnement
 class FastCocoDataset(torch.utils.data.Dataset):
     def __init__(self, img_dir, ann_data, transform=None):
